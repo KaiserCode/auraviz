@@ -38,31 +38,21 @@ jobs:
         export PKG_CONFIG_PATH="${SDK_PATH}/lib/pkgconfig"
         
         echo "=== Compiling ==="
-        gcc -Wall -O2 -shared \
+        gcc -Wall -O2 -shared -static-libgcc \
             -DMODULE_STRING=\"auraviz\" \
             $(pkg-config --cflags vlc-plugin) \
             -o libauraviz_plugin.dll \
             auraviz.c \
             $(pkg-config --libs vlc-plugin) \
-            -lopengl32 -lm -lws2_32
-        
-        echo "=== Finding dependencies ==="
-        ldd libauraviz_plugin.dll | grep mingw
-        
-        echo "=== Copying runtime DLLs ==="
-        mkdir -p dist
-        cp libauraviz_plugin.dll dist/
-        for dll in $(ldd libauraviz_plugin.dll | grep mingw | awk '{print $3}'); do
-            cp "$dll" dist/
-            echo "Copied: $dll"
-        done
+            -lopengl32 -lm -lws2_32 \
+            -Wl,-Bstatic -lpthread -Wl,-Bdynamic
         
         echo "=== Done ==="
-        ls -la dist/
+        ls -la libauraviz_plugin.dll
     
     - name: Upload Plugin DLL
       uses: actions/upload-artifact@v4
       with:
         name: auraviz-vlc-plugin-win64
-        path: dist/*
+        path: libauraviz_plugin.dll
         retention-days: 90
