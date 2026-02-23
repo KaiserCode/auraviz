@@ -16,6 +16,8 @@
 /* Fix Windows poll() issue — must come before VLC headers */
 #ifdef _WIN32
 # include <winsock2.h>
+# include <ws2tcpip.h>
+# define poll(fds, nfds, timeout) WSAPoll(fds, nfds, timeout)
 #endif
 
 #include <vlc_common.h>
@@ -147,7 +149,7 @@ static void bq_Kill(block_queue_t *q)
 /*****************************************************************************
  * Internal data
  *****************************************************************************/
-typedef struct
+struct filter_sys_t
 {
     vout_thread_t  *p_vout;
     picture_pool_t *pool;
@@ -164,7 +166,7 @@ typedef struct
 
     int   preset;
     float preset_time;
-} filter_sys_t;
+};
 
 /*****************************************************************************
  * Color helpers
@@ -373,7 +375,7 @@ static void render_frame(filter_sys_t *sys, picture_t *pic)
 static void *Thread(void *data)
 {
     filter_t *p_filter = (filter_t *)data;
-    filter_sys_t *sys = (filter_sys_t *)p_filter->p_sys;
+    filter_sys_t *sys = p_filter->p_sys;
     block_t *block;
 
     while ((block = bq_Dequeue(&sys->queue)) != NULL)
@@ -410,7 +412,7 @@ static void *Thread(void *data)
  *****************************************************************************/
 static block_t *DoWork(filter_t *p_filter, block_t *block)
 {
-    filter_sys_t *sys = (filter_sys_t *)p_filter->p_sys;
+    filter_sys_t *sys = p_filter->p_sys;
     block_t *dup = block_Duplicate(block);
     if (dup)
         bq_Enqueue(&sys->queue, dup);
@@ -455,7 +457,7 @@ static int Open(vlc_object_t *obj)
     }
 
     bq_Init(&sys->queue);
-    p_filter->p_sys = (filter_sys_t *)sys;
+    p_filter->p_sys = sys;
 
     if (vlc_clone(&sys->thread, Thread, p_filter, VLC_THREAD_PRIORITY_LOW)) {
         msg_Err(p_filter, "Failed to create thread");
@@ -482,7 +484,7 @@ static int Open(vlc_object_t *obj)
 static void Close(vlc_object_t *obj)
 {
     filter_t *p_filter = (filter_t *)obj;
-    filter_sys_t *sys = (filter_sys_t *)p_filter->p_sys;
+    filter_sys_t *sys = p_filter->p_sys;
 
     bq_Kill(&sys->queue);
     vlc_join(sys->thread, NULL);
