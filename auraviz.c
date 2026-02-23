@@ -2,10 +2,8 @@
  * auraviz.c: AuraViz - Audio visualization plugin for VLC 3.0.x (Windows)
  *****************************************************************************
  * Renders audio-reactive visuals to a VLC vout (video output) window.
- * Uses CPU rendering to a pixel buffer — no external OpenGL context needed.
+ * Uses CPU rendering to a pixel buffer.
  * Appears under Audio → Visualizations in VLC.
- *
- * Modeled after VLC's own modules/visualization/visual/visual.c
  *
  * Copyright (C) 2025 AuraViz Contributors
  * Licensed under GNU LGPL 2.1+
@@ -15,8 +13,10 @@
 # include "config.h"
 #endif
 
-#define __PLUGIN__
-#define MODULE_STRING "auraviz"
+/* Fix Windows poll() issue — must come before VLC headers */
+#ifdef _WIN32
+# include <winsock2.h>
+#endif
 
 #include <vlc_common.h>
 #include <vlc_plugin.h>
@@ -24,7 +24,6 @@
 #include <vlc_picture.h>
 #include <vlc_block.h>
 #include <vlc_picture_pool.h>
-#include <vlc_queue.h>
 
 #include <math.h>
 #include <string.h>
@@ -41,6 +40,7 @@
 #define VOUT_HEIGHT 500
 #define NUM_BANDS   64
 #define FFT_SIZE    512
+#define QUEUE_MAX   16
 
 #define WIDTH_TEXT "Video width"
 #define WIDTH_LONGTEXT "The width of the visualization window, in pixels."
@@ -68,18 +68,101 @@ vlc_module_begin ()
 vlc_module_end ()
 
 /*****************************************************************************
+ * Simple block queue (since vlc_queue.h is VLC 4.x only)
+ *****************************************************************************/
+typedef struct
+{
+    vlc_mutex_t lock;
+    vlc_cond_t  wait;
+    block_t    *first;
+    block_t   **lastp;
+    int         count;
+    bool        dead;
+} block_queue_t;
+
+static void block_queue_Init(block_queue_t *q)
+{
+    vlc_mutex_init(&q->lock);
+    vlc_cond_init(&q->wait);
+    q->first = NULL;
+    q->lastp = &q->first;
+    q->count = 0;
+    q->dead = false;
+}
+
+static void block_queue_Destroy(block_queue_t *q)
+{
+    /* Drain remaining blocks */
+    block_t *b = q->first;
+    while (b) {
+        block_t *next = b->p_next;
+        block_Release(b);
+        b = next;
+    }
+    vlc_mutex_destroy(&q->lock);
+    vlc_cond_destroy(&q->wait);
+}
+
+static void block_queue_Enqueue(block_queue_t *q, block_t *block)
+{
+    block->p_next = NULL;
+    vlc_mutex_lock(&q->lock);
+    if (q->count >= QUEUE_MAX) {
+        /* Drop oldest if full */
+        block_t *old = q->first;
+        q->first = old->p_next;
+        if (!q->first) q->lastp = &q->first;
+        q->count--;
+        block_Release(old);
+    }
+    *(q->lastp) = block;
+    q->lastp = &block->p_next;
+    q->count++;
+    vlc_cond_signal(&q->wait);
+    vlc_mutex_unlock(&q->lock);
+}
+
+/* Returns NULL when killed */
+static block_t *block_queue_Dequeue(block_queue_t *q)
+{
+    vlc_mutex_lock(&q->lock);
+    while (!q->first && !q->dead)
+        vlc_cond_wait(&q->wait, &q->lock);
+
+    if (q->dead && !q->first) {
+        vlc_mutex_unlock(&q->lock);
+        return NULL;
+    }
+
+    block_t *b = q->first;
+    q->first = b->p_next;
+    if (!q->first) q->lastp = &q->first;
+    q->count--;
+    vlc_mutex_unlock(&q->lock);
+    b->p_next = NULL;
+    return b;
+}
+
+static void block_queue_Kill(block_queue_t *q)
+{
+    vlc_mutex_lock(&q->lock);
+    q->dead = true;
+    vlc_cond_signal(&q->wait);
+    vlc_mutex_unlock(&q->lock);
+}
+
+/*****************************************************************************
  * Internal data
  *****************************************************************************/
 struct filter_sys_t
 {
     /* Video output */
-    vout_thread_t *p_vout;
+    vout_thread_t  *p_vout;
     picture_pool_t *pool;
 
     /* Threading */
-    vlc_thread_t thread;
-    vlc_queue_t  queue;
-    bool         dead;
+    vlc_thread_t   thread;
+    block_queue_t  queue;
 
     /* Config */
     int width;
@@ -106,7 +189,6 @@ static inline uint8_t clamp8(float v)
     return (uint8_t)v;
 }
 
-/* HSV to RGB */
 static void hsv2rgb(float h, float s, float v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     h = fmodf(h, 360.0f);
@@ -127,16 +209,14 @@ static void hsv2rgb(float h, float s, float v, uint8_t *r, uint8_t *g, uint8_t *
 }
 
 /*****************************************************************************
- * Audio analysis — simple DFT to get frequency bands
+ * Audio analysis
  *****************************************************************************/
 static void analyze_audio(filter_sys_t *sys, const float *samples,
                           int nb_samples, int channels)
 {
     if (nb_samples < 2) return;
-
     int n = nb_samples < FFT_SIZE ? nb_samples : FFT_SIZE;
 
-    /* Mono mixdown */
     float mono[FFT_SIZE];
     for (int i = 0; i < n; i++) {
         float sum = 0;
@@ -145,7 +225,6 @@ static void analyze_audio(filter_sys_t *sys, const float *samples,
         mono[i] = sum / channels;
     }
 
-    /* Simple DFT for each band */
     for (int band = 0; band < NUM_BANDS; band++) {
         float freq = (float)(band + 1) / NUM_BANDS * 0.5f;
         float re = 0, im = 0;
@@ -155,11 +234,9 @@ static void analyze_audio(filter_sys_t *sys, const float *samples,
             im += mono[i] * sinf(angle);
         }
         float mag = sqrtf(re * re + im * im) / n;
-        sys->bands[band] = mag;
         sys->smooth_bands[band] += (mag - sys->smooth_bands[band]) * 0.3f;
     }
 
-    /* Bass / mid / treble */
     float bass = 0, mid = 0, treble = 0;
     int be = NUM_BANDS / 6, me = NUM_BANDS / 2;
     for (int i = 0;  i < be;        i++) bass   += sys->smooth_bands[i];
@@ -176,102 +253,90 @@ static void analyze_audio(filter_sys_t *sys, const float *samples,
 }
 
 /*****************************************************************************
- * Rendering — draw into a RGBA pixel buffer
+ * Rendering — pixel-level effects into YUV buffer
  *****************************************************************************/
 
-/* Render a single pixel for the "Nebula" effect */
-static void render_pixel_nebula(filter_sys_t *sys, int px, int py,
-                                uint8_t *r, uint8_t *g, uint8_t *b)
+static void render_nebula(filter_sys_t *sys, int px, int py,
+                          uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    float w = sys->width, h = sys->height;
+    float w = (float)sys->width, h = (float)sys->height;
     float x = (px - w * 0.5f) / h;
     float y = (py - h * 0.5f) / h;
     float t = sys->time_acc * 0.3f;
-
-    float dist = sqrtf(x * x + y * y);
+    float dist = sqrtf(x*x + y*y);
     float angle = atan2f(y, x);
 
     float hue = fmodf(angle * 57.2958f + t * 50.0f + dist * 200.0f, 360.0f);
     float sat = 0.7f + 0.3f * sys->energy;
     float val = fmaxf(0.0f, 1.0f - dist * 1.5f + sys->bass * 0.8f);
 
-    /* Ring */
     float ring_dist = fabsf(dist - 0.4f - sys->bass * 0.2f);
     val += fmaxf(0.0f, 0.15f - ring_dist) * 8.0f * sys->treble;
-
-    /* Center glow */
     val += sys->bass * 0.3f / (dist * 8.0f + 0.5f);
-
     val = fminf(val, 1.0f);
+
     hsv2rgb(hue, sat, val, r, g, b);
 }
 
-/* Render "Plasma" effect */
-static void render_pixel_plasma(filter_sys_t *sys, int px, int py,
-                                uint8_t *r, uint8_t *g, uint8_t *b)
+static void render_plasma(filter_sys_t *sys, int px, int py,
+                          uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    float w = sys->width, h = sys->height;
+    float w = (float)sys->width, h = (float)sys->height;
     float x = (px - w * 0.5f) / h;
     float y = (py - h * 0.5f) / h;
     float t = sys->time_acc * 0.5f;
 
-    float v = sinf(x * 10.0f + t + sys->bass * 5.0f)
-            + sinf(y * 10.0f + t * 0.5f)
-            + sinf(sqrtf(x * x + y * y) * 12.0f + t)
-            + sinf(sqrtf((x + 0.5f) * (x + 0.5f) + y * y) * 8.0f);
+    float v = sinf(x*10+t+sys->bass*5) + sinf(y*10+t*0.5f)
+            + sinf(sqrtf(x*x+y*y)*12+t)
+            + sinf(sqrtf((x+0.5f)*(x+0.5f)+y*y)*8);
     v *= 0.25f;
 
-    *r = clamp8((sinf(v * (float)M_PI + sys->energy * 2.0f) * 0.5f + 0.5f) * 255);
-    *g = clamp8((sinf(v * (float)M_PI + 2.094f + sys->bass * 3.0f) * 0.5f + 0.5f) * 255);
-    *b = clamp8((sinf(v * (float)M_PI + 4.188f + sys->treble * 2.0f) * 0.5f + 0.5f) * 255);
+    *r = clamp8((sinf(v*(float)M_PI+sys->energy*2)*0.5f+0.5f)*255);
+    *g = clamp8((sinf(v*(float)M_PI+2.094f+sys->bass*3)*0.5f+0.5f)*255);
+    *b = clamp8((sinf(v*(float)M_PI+4.188f+sys->treble*2)*0.5f+0.5f)*255);
 }
 
-/* Render "Tunnel" effect */
-static void render_pixel_tunnel(filter_sys_t *sys, int px, int py,
-                                uint8_t *r, uint8_t *g, uint8_t *b)
+static void render_tunnel(filter_sys_t *sys, int px, int py,
+                          uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    float w = sys->width, h = sys->height;
+    float w = (float)sys->width, h = (float)sys->height;
     float x = (px - w * 0.5f) / h;
     float y = (py - h * 0.5f) / h;
     float t = sys->time_acc * 0.5f;
-
-    float dist = sqrtf(x * x + y * y) + 0.001f;
+    float dist = sqrtf(x*x + y*y) + 0.001f;
     float angle = atan2f(y, x);
     float tunnel = 1.0f / dist;
 
-    float pattern = sinf(tunnel * 2.0f - t * 3.0f + angle * 3.0f) * 0.5f
-                  + sinf(tunnel * 4.0f - t * 5.0f) * 0.3f * sys->mid;
+    float pattern = sinf(tunnel*2-t*3+angle*3)*0.5f
+                  + sinf(tunnel*4-t*5)*0.3f*sys->mid;
 
     float hue = fmodf(pattern * 120.0f + t * 30.0f, 360.0f);
-    float val = (1.0f - dist * 0.7f) * (0.5f + sys->energy * 0.5f);
+    float val = (1.0f - dist*0.7f) * (0.5f + sys->energy*0.5f);
     val += sys->bass * 0.5f / (dist * 10.0f + 0.5f);
     val = fmaxf(0.0f, fminf(val, 1.0f));
 
     hsv2rgb(hue, 0.8f, val, r, g, b);
 }
 
-/* Render "Spectrum bars" effect */
-static void render_pixel_spectrum(filter_sys_t *sys, int px, int py,
-                                  uint8_t *r, uint8_t *g, uint8_t *b)
+static void render_spectrum(filter_sys_t *sys, int px, int py,
+                            uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    float w = sys->width, h = sys->height;
+    float w = (float)sys->width, h = (float)sys->height;
     float t = sys->time_acc;
-    int num_bars = NUM_BANDS;
-    float bar_width = w / num_bars;
+    float bar_width = w / NUM_BANDS;
 
     int bar_idx = (int)(px / bar_width);
-    if (bar_idx >= num_bars) bar_idx = num_bars - 1;
+    if (bar_idx >= NUM_BANDS) bar_idx = NUM_BANDS - 1;
 
     float bar_height = sys->smooth_bands[bar_idx] * h * 6.0f;
     float y_from_bottom = h - py;
 
     if (y_from_bottom < bar_height) {
         float pct = y_from_bottom / (h * 0.8f);
-        float hue = fmodf((float)bar_idx / num_bars * 270.0f + t * 20.0f, 360.0f);
+        float hue = fmodf((float)bar_idx / NUM_BANDS * 270.0f + t * 20.0f, 360.0f);
         float val = 0.3f + 0.7f * (1.0f - pct);
         hsv2rgb(hue, 0.9f, val, r, g, b);
     } else {
-        /* Background — subtle glow */
         float glow = sys->energy * 0.05f;
         *r = clamp8(glow * 50);
         *g = clamp8(glow * 80);
@@ -282,27 +347,19 @@ static void render_pixel_spectrum(filter_sys_t *sys, int px, int py,
 typedef void (*render_fn)(filter_sys_t*, int, int, uint8_t*, uint8_t*, uint8_t*);
 
 static const render_fn renderers[] = {
-    render_pixel_nebula,
-    render_pixel_plasma,
-    render_pixel_tunnel,
-    render_pixel_spectrum,
+    render_nebula, render_plasma, render_tunnel, render_spectrum,
 };
 #define NUM_PRESETS (int)(sizeof(renderers)/sizeof(renderers[0]))
 
 static void render_frame(filter_sys_t *sys, picture_t *pic)
 {
-    int w = sys->width;
-    int h = sys->height;
-
-    /* Get writable plane — we write RGBA (or BGRA) data into I420 Y plane
-     * as VLC will convert as needed. For simplicity, we'll write to the
-     * picture planes directly. VLC uses I420 format. */
-    uint8_t *y_plane  = pic->p[0].p_pixels;
-    uint8_t *u_plane  = pic->p[1].p_pixels;
-    uint8_t *v_plane  = pic->p[2].p_pixels;
-    int y_pitch = pic->p[0].i_pitch;
-    int u_pitch = pic->p[1].i_pitch;
-    int v_pitch = pic->p[2].i_pitch;
+    int w = sys->width, h = sys->height;
+    uint8_t *yp = pic->p[0].p_pixels;
+    uint8_t *up = pic->p[1].p_pixels;
+    uint8_t *vp = pic->p[2].p_pixels;
+    int ypitch = pic->p[0].i_pitch;
+    int upitch = pic->p[1].i_pitch;
+    int vpitch = pic->p[2].i_pitch;
 
     render_fn render = renderers[sys->preset % NUM_PRESETS];
 
@@ -311,51 +368,44 @@ static void render_frame(filter_sys_t *sys, picture_t *pic)
             uint8_t r, g, b;
             render(sys, px, py, &r, &g, &b);
 
-            /* RGB to YUV */
-            int Y = ((66 * r + 129 * g +  25 * b + 128) >> 8) + 16;
-            y_plane[py * y_pitch + px] = (uint8_t)(Y > 255 ? 255 : (Y < 0 ? 0 : Y));
+            int Y = ((66*r + 129*g + 25*b + 128) >> 8) + 16;
+            yp[py * ypitch + px] = (uint8_t)(Y < 0 ? 0 : (Y > 255 ? 255 : Y));
 
             if ((px & 1) == 0 && (py & 1) == 0) {
-                int U = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                int V = ((112 * r - 94 * g -  18 * b + 128) >> 8) + 128;
-                u_plane[(py/2) * u_pitch + (px/2)] = (uint8_t)(U > 255 ? 255 : (U < 0 ? 0 : U));
-                v_plane[(py/2) * v_pitch + (px/2)] = (uint8_t)(V > 255 ? 255 : (V < 0 ? 0 : V));
+                int U = ((-38*r - 74*g + 112*b + 128) >> 8) + 128;
+                int V = ((112*r - 94*g - 18*b + 128) >> 8) + 128;
+                up[(py/2)*upitch + (px/2)] = (uint8_t)(U < 0 ? 0 : (U > 255 ? 255 : U));
+                vp[(py/2)*vpitch + (px/2)] = (uint8_t)(V < 0 ? 0 : (V > 255 ? 255 : V));
             }
         }
     }
 }
 
 /*****************************************************************************
- * Render thread — consumes audio blocks, renders frames
+ * Render thread
  *****************************************************************************/
 static void *Thread(void *data)
 {
     filter_t *filter = (filter_t *)data;
     filter_sys_t *sys = filter->p_sys;
-
     block_t *block;
 
-    while ((block = vlc_queue_DequeueKillable(&sys->queue, &sys->dead)))
+    while ((block = block_queue_Dequeue(&sys->queue)) != NULL)
     {
-        /* Analyze audio */
         const float *samples = (const float *)block->p_buffer;
         int nb_samples = block->i_nb_samples;
         int channels = aout_FormatNbChannels(&filter->fmt_in.audio);
+
         analyze_audio(sys, samples, nb_samples, channels);
 
-        /* Time tracking */
-        sys->time_acc += (float)nb_samples /
-                         (float)filter->fmt_in.audio.i_rate;
+        sys->time_acc += (float)nb_samples / (float)filter->fmt_in.audio.i_rate;
+        sys->preset_time += (float)nb_samples / (float)filter->fmt_in.audio.i_rate;
 
-        /* Auto-switch preset on strong beats */
-        sys->preset_time += (float)nb_samples /
-                            (float)filter->fmt_in.audio.i_rate;
         if (sys->bass > 0.8f && sys->preset_time > 12.0f) {
             sys->preset = (sys->preset + 1) % NUM_PRESETS;
             sys->preset_time = 0;
         }
 
-        /* Get a picture from the pool */
         picture_t *pic = picture_pool_Wait(sys->pool);
         if (pic) {
             render_frame(sys, pic);
@@ -370,14 +420,14 @@ static void *Thread(void *data)
 }
 
 /*****************************************************************************
- * Filter callback — VLC sends audio blocks here
+ * Filter callback
  *****************************************************************************/
 static block_t *DoWork(filter_t *filter, block_t *block)
 {
     filter_sys_t *sys = filter->p_sys;
     block_t *dup = block_Duplicate(block);
     if (dup)
-        vlc_queue_Enqueue(&sys->queue, dup);
+        block_queue_Enqueue(&sys->queue, dup);
     return block;
 }
 
@@ -392,22 +442,17 @@ static const struct vlc_filter_operations filter_ops = {
 };
 
 /*****************************************************************************
- * Open
+ * Open / Close
  *****************************************************************************/
 static int Open(vlc_object_t *obj)
 {
     filter_t *filter = (filter_t *)obj;
-
     filter_sys_t *sys = calloc(1, sizeof(*sys));
     if (!sys) return VLC_ENOMEM;
 
     sys->width  = var_InheritInteger(filter, "auraviz-width");
     sys->height = var_InheritInteger(filter, "auraviz-height");
-    sys->preset = 0;
-    sys->preset_time = 0;
-    sys->time_acc = 0;
 
-    /* Create video format */
     video_format_t fmt;
     video_format_Init(&fmt, VLC_CODEC_I420);
     fmt.i_width = fmt.i_visible_width = sys->width;
@@ -415,7 +460,6 @@ static int Open(vlc_object_t *obj)
     fmt.i_sar_num = 1;
     fmt.i_sar_den = 1;
 
-    /* Allocate picture pool */
     sys->pool = picture_pool_NewFromFormat(&fmt, 3);
     if (!sys->pool) {
         msg_Err(filter, "Failed to create picture pool");
@@ -423,7 +467,6 @@ static int Open(vlc_object_t *obj)
         return VLC_EGENERIC;
     }
 
-    /* Open video output */
     sys->p_vout = aout_filter_GetVout(filter, &fmt);
     if (!sys->p_vout) {
         msg_Err(filter, "Failed to open video output");
@@ -432,16 +475,14 @@ static int Open(vlc_object_t *obj)
         return VLC_EGENERIC;
     }
 
-    /* Set up threading */
-    sys->dead = false;
-    vlc_queue_Init(&sys->queue, offsetof(block_t, p_next));
-
+    block_queue_Init(&sys->queue);
     filter->p_sys = sys;
 
     if (vlc_clone(&sys->thread, Thread, filter, VLC_THREAD_PRIORITY_LOW)) {
         msg_Err(filter, "Failed to create thread");
         vout_Close(sys->p_vout);
         picture_pool_Release(sys->pool);
+        block_queue_Destroy(&sys->queue);
         free(sys);
         return VLC_EGENERIC;
     }
@@ -450,23 +491,20 @@ static int Open(vlc_object_t *obj)
     filter->fmt_out.audio = filter->fmt_in.audio;
     filter->ops = &filter_ops;
 
-    msg_Info(filter, "AuraViz started — preset: Nebula");
+    msg_Info(filter, "AuraViz visualization started");
     return VLC_SUCCESS;
 }
 
-/*****************************************************************************
- * Close
- *****************************************************************************/
 static void Close(vlc_object_t *obj)
 {
     filter_t *filter = (filter_t *)obj;
     filter_sys_t *sys = filter->p_sys;
 
-    /* Signal thread to stop and drain queue */
-    vlc_queue_Kill(&sys->queue, &sys->dead);
+    block_queue_Kill(&sys->queue);
     vlc_join(sys->thread, NULL);
 
     vout_Close(sys->p_vout);
     picture_pool_Release(sys->pool);
+    block_queue_Destroy(&sys->queue);
     free(sys);
 }
