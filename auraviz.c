@@ -44,7 +44,6 @@
 #define VOUT_WIDTH  800
 #define VOUT_HEIGHT 500
 #define NUM_BANDS   64
-#define FFT_SIZE    512
 #define MAX_BLOCKS  100
 #define AURAVIZ_DELAY 400000
 
@@ -93,9 +92,13 @@ typedef struct
     int          i_blocks;
     bool         b_exit;
 
+    /* Audio analysis results */
+    float bands[NUM_BANDS];
     float smooth_bands[NUM_BANDS];
+    float peak_bands[NUM_BANDS];
     float bass, mid, treble, energy;
     float time_acc;
+    unsigned int frame_count;
 
     int   preset;
     float preset_time;
@@ -110,189 +113,412 @@ struct filter_sys_t
 };
 
 /*****************************************************************************
- * Color helpers
+ * Fast inline helpers
  *****************************************************************************/
-static inline uint8_t clamp8(float v)
+static inline uint8_t clamp8(int v)
 {
-    if (v < 0.0f) return 0;
-    if (v > 255.0f) return 255;
+    if (v < 0) return 0;
+    if (v > 255) return 255;
     return (uint8_t)v;
 }
 
-static void hsv2rgb(float h, float s, float v, uint8_t *r, uint8_t *g, uint8_t *b)
+/* Write a BGRX pixel */
+static inline void put_pixel(uint8_t *p, uint8_t r, uint8_t g, uint8_t b)
 {
-    h = fmodf(h, 360.0f);
+    p[0] = b; p[1] = g; p[2] = r; p[3] = 0xFF;
+}
+
+/* Simple fast HSV to RGB - h: 0-360, s: 0-1, v: 0-1 */
+static inline void hsv_fast(float h, float s, float v,
+                            uint8_t *r, uint8_t *g, uint8_t *b)
+{
     if (h < 0) h += 360.0f;
-    float c = v * s;
-    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
-    float m = v - c;
-    float rf, gf, bf;
-    if      (h < 60)  { rf=c; gf=x; bf=0; }
-    else if (h < 120) { rf=x; gf=c; bf=0; }
-    else if (h < 180) { rf=0; gf=c; bf=x; }
-    else if (h < 240) { rf=0; gf=x; bf=c; }
-    else if (h < 300) { rf=x; gf=0; bf=c; }
-    else              { rf=c; gf=0; bf=x; }
-    *r = clamp8((rf + m) * 255.0f);
-    *g = clamp8((gf + m) * 255.0f);
-    *b = clamp8((bf + m) * 255.0f);
+    if (h >= 360.0f) h -= 360.0f;
+    int hi = (int)(h / 60.0f) % 6;
+    float f = h / 60.0f - hi;
+    int V = (int)(v * 255.0f);
+    int p2 = (int)(v * (1.0f - s) * 255.0f);
+    int q = (int)(v * (1.0f - f * s) * 255.0f);
+    int t = (int)(v * (1.0f - (1.0f - f) * s) * 255.0f);
+    switch(hi) {
+        case 0: *r=V; *g=t; *b=p2; break;
+        case 1: *r=q; *g=V; *b=p2; break;
+        case 2: *r=p2; *g=V; *b=t; break;
+        case 3: *r=p2; *g=q; *b=V; break;
+        case 4: *r=t; *g=p2; *b=V; break;
+        default: *r=V; *g=p2; *b=q; break;
+    }
 }
 
 /*****************************************************************************
- * Audio analysis
+ * Audio analysis - fast version using simple energy binning
  *****************************************************************************/
-static void analyze_audio(auraviz_thread_t *p_thread,
+static void analyze_audio(auraviz_thread_t *p,
                           const float *samples,
                           int nb_samples, int channels)
 {
-    if (nb_samples < 2) return;
-    int n = nb_samples < FFT_SIZE ? nb_samples : FFT_SIZE;
+    if (nb_samples < 2 || channels < 1) return;
 
-    float mono[FFT_SIZE];
-    for (int i = 0; i < n; i++) {
-        float sum = 0;
-        for (int c = 0; c < channels; c++)
-            sum += samples[i * channels + c];
-        mono[i] = sum / channels;
-    }
+    /* Simple energy-in-bands approach: divide samples into NUM_BANDS chunks */
+    int samples_per_band = nb_samples / NUM_BANDS;
+    if (samples_per_band < 1) samples_per_band = 1;
 
     for (int band = 0; band < NUM_BANDS; band++) {
-        float freq = (float)(band + 1) / NUM_BANDS * 0.5f;
-        float re = 0, im = 0;
-        for (int i = 0; i < n; i++) {
-            float angle = 2.0f * (float)M_PI * freq * i;
-            re += mono[i] * cosf(angle);
-            im += mono[i] * sinf(angle);
+        float sum = 0;
+        int start = band * samples_per_band;
+        int end = start + samples_per_band;
+        if (end > nb_samples) end = nb_samples;
+        for (int i = start; i < end; i++) {
+            float mono = 0;
+            for (int c = 0; c < channels; c++)
+                mono += samples[i * channels + c];
+            mono /= channels;
+            sum += mono * mono;
         }
-        float mag = sqrtf(re * re + im * im) / n;
-        p_thread->smooth_bands[band] += (mag - p_thread->smooth_bands[band]) * 0.3f;
+        float rms = sqrtf(sum / (end - start + 1));
+        p->bands[band] = rms;
+
+        /* Smooth with attack/decay */
+        if (rms > p->smooth_bands[band])
+            p->smooth_bands[band] += (rms - p->smooth_bands[band]) * 0.6f;
+        else
+            p->smooth_bands[band] += (rms - p->smooth_bands[band]) * 0.15f;
+
+        /* Peak hold with decay */
+        if (p->smooth_bands[band] > p->peak_bands[band])
+            p->peak_bands[band] = p->smooth_bands[band];
+        else
+            p->peak_bands[band] *= 0.97f;
     }
 
+    /* Compute bass / mid / treble */
     float bass = 0, mid = 0, treble = 0;
-    int be = NUM_BANDS / 6, me = NUM_BANDS / 2;
-    for (int i = 0;  i < be;        i++) bass   += p_thread->smooth_bands[i];
-    for (int i = be; i < me;         i++) mid    += p_thread->smooth_bands[i];
-    for (int i = me; i < NUM_BANDS;  i++) treble += p_thread->smooth_bands[i];
-    bass   /= be;
-    mid    /= (me - be);
-    treble /= (NUM_BANDS - me);
+    int b3 = NUM_BANDS / 3;
+    for (int i = 0; i < b3; i++) bass += p->smooth_bands[i];
+    for (int i = b3; i < 2*b3; i++) mid += p->smooth_bands[i];
+    for (int i = 2*b3; i < NUM_BANDS; i++) treble += p->smooth_bands[i];
+    bass /= b3; mid /= b3; treble /= (NUM_BANDS - 2*b3);
 
-    p_thread->bass   += (fminf(bass   * 8.0f,  1.0f) - p_thread->bass)   * 0.2f;
-    p_thread->mid    += (fminf(mid    * 12.0f, 1.0f) - p_thread->mid)    * 0.2f;
-    p_thread->treble += (fminf(treble * 16.0f, 1.0f) - p_thread->treble) * 0.2f;
-    p_thread->energy = (p_thread->bass + p_thread->mid + p_thread->treble) / 3.0f;
+    /* Scale up and smooth */
+    float target_bass = bass * 12.0f;
+    float target_mid = mid * 16.0f;
+    float target_treble = treble * 20.0f;
+    if (target_bass > 1.0f) target_bass = 1.0f;
+    if (target_mid > 1.0f) target_mid = 1.0f;
+    if (target_treble > 1.0f) target_treble = 1.0f;
+
+    p->bass += (target_bass - p->bass) * 0.3f;
+    p->mid += (target_mid - p->mid) * 0.3f;
+    p->treble += (target_treble - p->treble) * 0.3f;
+    p->energy = (p->bass + p->mid + p->treble) / 3.0f;
 }
 
 /*****************************************************************************
- * Rendering effects — RGB32 (BGRX byte order)
+ * EFFECT 1: Spectrum bars with glow and reflections
  *****************************************************************************/
-static void render_nebula(auraviz_thread_t *p, int px, int py, uint8_t *out)
-{
-    float w = (float)p->i_width, h = (float)p->i_height;
-    float x = (px - w * 0.5f) / h;
-    float y = (py - h * 0.5f) / h;
-    float t = p->time_acc * 0.3f;
-    float dist = sqrtf(x*x + y*y);
-    float angle = atan2f(y, x);
-
-    float hue = fmodf(angle * 57.2958f + t * 50.0f + dist * 200.0f, 360.0f);
-    float sat = 0.7f + 0.3f * p->energy;
-    float val = fmaxf(0.0f, 1.0f - dist * 1.5f + p->bass * 0.8f);
-
-    float ring_dist = fabsf(dist - 0.4f - p->bass * 0.2f);
-    val += fmaxf(0.0f, 0.15f - ring_dist) * 8.0f * p->treble;
-    val += p->bass * 0.3f / (dist * 8.0f + 0.5f);
-    val = fminf(val, 1.0f);
-
-    uint8_t r, g, b;
-    hsv2rgb(hue, sat, val, &r, &g, &b);
-    out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
-}
-
-static void render_plasma(auraviz_thread_t *p, int px, int py, uint8_t *out)
-{
-    float w = (float)p->i_width, h = (float)p->i_height;
-    float x = (px - w * 0.5f) / h;
-    float y = (py - h * 0.5f) / h;
-    float t = p->time_acc * 0.5f;
-
-    float v = sinf(x*10+t+p->bass*5) + sinf(y*10+t*0.5f)
-            + sinf(sqrtf(x*x+y*y)*12+t)
-            + sinf(sqrtf((x+0.5f)*(x+0.5f)+y*y)*8);
-    v *= 0.25f;
-
-    uint8_t r = clamp8((sinf(v*(float)M_PI+p->energy*2)*0.5f+0.5f)*255);
-    uint8_t g = clamp8((sinf(v*(float)M_PI+2.094f+p->bass*3)*0.5f+0.5f)*255);
-    uint8_t b = clamp8((sinf(v*(float)M_PI+4.188f+p->treble*2)*0.5f+0.5f)*255);
-    out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
-}
-
-static void render_tunnel(auraviz_thread_t *p, int px, int py, uint8_t *out)
-{
-    float w = (float)p->i_width, h = (float)p->i_height;
-    float x = (px - w * 0.5f) / h;
-    float y = (py - h * 0.5f) / h;
-    float t = p->time_acc * 0.5f;
-    float dist = sqrtf(x*x + y*y) + 0.001f;
-    float angle = atan2f(y, x);
-    float tunnel = 1.0f / dist;
-
-    float pattern = sinf(tunnel*2-t*3+angle*3)*0.5f
-                  + sinf(tunnel*4-t*5)*0.3f*p->mid;
-
-    float hue = fmodf(pattern * 120.0f + t * 30.0f, 360.0f);
-    float val = (1.0f - dist*0.7f) * (0.5f + p->energy*0.5f);
-    val += p->bass * 0.5f / (dist * 10.0f + 0.5f);
-    val = fmaxf(0.0f, fminf(val, 1.0f));
-
-    uint8_t r, g, b;
-    hsv2rgb(hue, 0.8f, val, &r, &g, &b);
-    out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
-}
-
-static void render_spectrum(auraviz_thread_t *p, int px, int py, uint8_t *out)
-{
-    float w = (float)p->i_width, h = (float)p->i_height;
-    float t = p->time_acc;
-    float bar_width = w / NUM_BANDS;
-
-    int bar_idx = (int)(px / bar_width);
-    if (bar_idx >= NUM_BANDS) bar_idx = NUM_BANDS - 1;
-
-    float bar_height = p->smooth_bands[bar_idx] * h * 6.0f;
-    float y_from_bottom = h - py;
-
-    uint8_t r, g, b;
-    if (y_from_bottom < bar_height) {
-        float pct = y_from_bottom / (h * 0.8f);
-        float hue = fmodf((float)bar_idx / NUM_BANDS * 270.0f + t * 20.0f, 360.0f);
-        float val = 0.3f + 0.7f * (1.0f - pct);
-        hsv2rgb(hue, 0.9f, val, &r, &g, &b);
-    } else {
-        float glow = p->energy * 0.05f;
-        r = clamp8(glow * 50);
-        g = clamp8(glow * 80);
-        b = clamp8(glow * 120);
-    }
-    out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
-}
-
-typedef void (*render_fn)(auraviz_thread_t*, int, int, uint8_t*);
-
-static const render_fn renderers[] = {
-    render_nebula, render_plasma, render_tunnel, render_spectrum,
-};
-#define NUM_PRESETS (int)(sizeof(renderers)/sizeof(renderers[0]))
-
-static void render_frame(auraviz_thread_t *p, uint8_t *plane)
+static void render_spectrum(auraviz_thread_t *p, uint8_t *buf, int pitch)
 {
     int w = p->i_width, h = p->i_height;
-    render_fn render = renderers[p->preset % NUM_PRESETS];
+    float t = p->time_acc;
 
-    for (int py = 0; py < h; py++) {
-        uint8_t *row = plane + py * w * 4;
-        for (int px = 0; px < w; px++) {
-            render(p, px, py, row + px * 4);
+    /* Clear to dark background with subtle color */
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = buf + y * pitch;
+        int bg_b = (int)(8 + p->energy * 20);
+        int bg_g = (int)(5 + p->bass * 10);
+        int bg_r = (int)(3 + p->treble * 8);
+        for (int x = 0; x < w; x++) {
+            put_pixel(row + x * 4, bg_r, bg_g, bg_b);
+        }
+    }
+
+    float bar_w = (float)w / NUM_BANDS;
+    int mirror_y = h * 3 / 4;
+
+    for (int band = 0; band < NUM_BANDS; band++) {
+        float val = p->smooth_bands[band] * 6.0f;
+        if (val > 1.0f) val = 1.0f;
+        float peak = p->peak_bands[band] * 6.0f;
+        if (peak > 1.0f) peak = 1.0f;
+
+        int bar_h = (int)(val * mirror_y * 0.9f);
+        int peak_y = mirror_y - (int)(peak * mirror_y * 0.9f);
+
+        int x_start = (int)(band * bar_w) + 1;
+        int x_end = (int)((band + 1) * bar_w) - 1;
+        if (x_end >= w) x_end = w - 1;
+
+        float hue = (float)band / NUM_BANDS * 270.0f + t * 15.0f;
+        if (hue >= 360.0f) hue -= 360.0f;
+
+        /* Draw main bar */
+        for (int y = mirror_y - bar_h; y < mirror_y; y++) {
+            if (y < 0) continue;
+            float pct = (float)(mirror_y - y) / (mirror_y * 0.9f);
+            float v = 0.4f + 0.6f * (1.0f - pct);
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.85f, v, &r, &g, &b);
+            uint8_t *row = buf + y * pitch;
+            for (int x = x_start; x < x_end; x++)
+                put_pixel(row + x * 4, r, g, b);
+        }
+
+        /* Draw peak marker */
+        if (peak_y >= 0 && peak_y < h) {
+            uint8_t *row = buf + peak_y * pitch;
+            for (int x = x_start; x < x_end; x++)
+                put_pixel(row + x * 4, 255, 255, 255);
+        }
+
+        /* Draw reflection (dimmer, below mirror line) */
+        int refl_h = bar_h / 3;
+        for (int dy = 0; dy < refl_h && (mirror_y + dy) < h; dy++) {
+            float fade = 1.0f - (float)dy / refl_h;
+            fade *= 0.3f;
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.6f, fade * 0.5f, &r, &g, &b);
+            uint8_t *row = buf + (mirror_y + dy) * pitch;
+            for (int x = x_start; x < x_end; x++)
+                put_pixel(row + x * 4, r, g, b);
+        }
+    }
+}
+
+/*****************************************************************************
+ * EFFECT 2: Waveform oscilloscope with color trails
+ *****************************************************************************/
+static void render_wave(auraviz_thread_t *p, uint8_t *buf, int pitch,
+                        const float *samples, int nb_samples, int channels)
+{
+    int w = p->i_width, h = p->i_height;
+
+    /* Fade previous frame (trail effect) */
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = buf + y * pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t *px = row + x * 4;
+            px[0] = px[0] * 85 / 100;  /* B */
+            px[1] = px[1] * 85 / 100;  /* G */
+            px[2] = px[2] * 85 / 100;  /* R */
+        }
+    }
+
+    if (nb_samples < 2 || !samples) return;
+
+    /* Draw waveform */
+    int step = nb_samples / w;
+    if (step < 1) step = 1;
+    int mid_y = h / 2;
+
+    float hue_base = p->time_acc * 30.0f;
+    int prev_y = mid_y;
+
+    for (int x = 0; x < w; x++) {
+        int si = x * step;
+        if (si >= nb_samples) si = nb_samples - 1;
+
+        /* Mix to mono */
+        float val = 0;
+        for (int c = 0; c < channels; c++)
+            val += samples[si * channels + c];
+        val /= channels;
+
+        int y = mid_y - (int)(val * h * 0.4f);
+        if (y < 0) y = 0;
+        if (y >= h) y = h - 1;
+
+        /* Draw line from prev_y to y */
+        int y0 = prev_y < y ? prev_y : y;
+        int y1 = prev_y > y ? prev_y : y;
+        if (y0 == y1) y1 = y0 + 1;
+
+        float hue = hue_base + (float)x / w * 180.0f;
+        while (hue >= 360.0f) hue -= 360.0f;
+        uint8_t r, g, b;
+        float bright = 0.7f + 0.3f * p->energy;
+        hsv_fast(hue, 0.9f, bright, &r, &g, &b);
+
+        for (int dy = y0; dy <= y1 && dy < h; dy++) {
+            uint8_t *px = buf + dy * pitch + x * 4;
+            put_pixel(px, r, g, b);
+            /* Glow: adjacent pixels */
+            if (x > 0) {
+                uint8_t *px2 = buf + dy * pitch + (x-1) * 4;
+                px2[0] = clamp8(px2[0] + b/3);
+                px2[1] = clamp8(px2[1] + g/3);
+                px2[2] = clamp8(px2[2] + r/3);
+            }
+        }
+
+        prev_y = y;
+    }
+
+    /* Draw center line */
+    {
+        uint8_t *row = buf + mid_y * pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t *px = row + x * 4;
+            px[0] = clamp8(px[0] + 20);
+            px[1] = clamp8(px[1] + 25);
+            px[2] = clamp8(px[2] + 15);
+        }
+    }
+}
+
+/*****************************************************************************
+ * EFFECT 3: Circular spectrum
+ *****************************************************************************/
+static void render_circular(auraviz_thread_t *p, uint8_t *buf, int pitch)
+{
+    int w = p->i_width, h = p->i_height;
+    float cx = w * 0.5f, cy = h * 0.5f;
+    float t = p->time_acc;
+
+    /* Fade previous frame */
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = buf + y * pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t *px = row + x * 4;
+            px[0] = px[0] * 90 / 100;
+            px[1] = px[1] * 90 / 100;
+            px[2] = px[2] * 90 / 100;
+        }
+    }
+
+    float base_r = h * 0.15f + p->bass * h * 0.1f;
+
+    /* Pre-compute sin/cos table for NUM_BANDS points around circle */
+    for (int band = 0; band < NUM_BANDS; band++) {
+        float angle = (float)band / NUM_BANDS * 2.0f * (float)M_PI + t * 0.5f;
+        float ca = cosf(angle);
+        float sa = sinf(angle);
+
+        float val = p->smooth_bands[band] * 5.0f;
+        if (val > 1.0f) val = 1.0f;
+        float bar_len = val * h * 0.25f;
+
+        float hue = (float)band / NUM_BANDS * 360.0f + t * 20.0f;
+        while (hue >= 360.0f) hue -= 360.0f;
+        uint8_t r, g, b;
+        hsv_fast(hue, 0.9f, 0.5f + val * 0.5f, &r, &g, &b);
+
+        /* Draw line from base_r to base_r + bar_len */
+        int steps = (int)(bar_len + 1);
+        for (int s = 0; s < steps; s++) {
+            float radius = base_r + s;
+            int px = (int)(cx + radius * ca);
+            int py = (int)(cy + radius * sa);
+            if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+            uint8_t *dest = buf + py * pitch + px * 4;
+            put_pixel(dest, r, g, b);
+            /* Slight thickness */
+            if (px + 1 < w)
+                put_pixel(dest + 4, r, g, b);
+        }
+
+        /* Draw inner glow dot at base */
+        int bx = (int)(cx + base_r * ca);
+        int by = (int)(cy + base_r * sa);
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int xx = bx + dx, yy = by + dy;
+                if (xx >= 0 && xx < w && yy >= 0 && yy < h) {
+                    uint8_t *dest = buf + yy * pitch + xx * 4;
+                    put_pixel(dest, 
+                        clamp8(r + 80), 
+                        clamp8(g + 80), 
+                        clamp8(b + 80));
+                }
+            }
+        }
+    }
+}
+
+/*****************************************************************************
+ * EFFECT 4: Particle fountain
+ *****************************************************************************/
+#define MAX_PARTICLES 300
+typedef struct {
+    float x, y, vx, vy;
+    float life;
+    float hue;
+} particle_t;
+
+static particle_t particles[MAX_PARTICLES];
+static bool particles_init = false;
+
+static void render_particles(auraviz_thread_t *p, uint8_t *buf, int pitch)
+{
+    int w = p->i_width, h = p->i_height;
+
+    if (!particles_init) {
+        memset(particles, 0, sizeof(particles));
+        particles_init = true;
+    }
+
+    /* Fade background */
+    for (int y = 0; y < h; y++) {
+        uint8_t *row = buf + y * pitch;
+        for (int x = 0; x < w; x++) {
+            uint8_t *px = row + x * 4;
+            px[0] = px[0] * 92 / 100;
+            px[1] = px[1] * 92 / 100;
+            px[2] = px[2] * 92 / 100;
+        }
+    }
+
+    float dt = 0.03f;
+
+    /* Spawn particles based on energy */
+    int spawn_count = (int)(p->energy * 15 + p->bass * 10);
+    for (int i = 0; i < MAX_PARTICLES && spawn_count > 0; i++) {
+        if (particles[i].life <= 0) {
+            particles[i].x = w * 0.5f + (float)((p->frame_count * 7 + i * 13) % 200 - 100);
+            particles[i].y = h * 0.7f;
+            particles[i].vx = (float)((p->frame_count * 3 + i * 17) % 400 - 200) / 50.0f;
+            particles[i].vy = -(3.0f + p->bass * 8.0f + (float)((i * 31) % 100) / 25.0f);
+            particles[i].life = 1.0f;
+            particles[i].hue = p->time_acc * 40.0f + (float)(i % 60) * 6.0f;
+            spawn_count--;
+        }
+    }
+
+    /* Update and draw particles */
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (particles[i].life <= 0) continue;
+
+        particles[i].x += particles[i].vx;
+        particles[i].y += particles[i].vy;
+        particles[i].vy += 0.08f; /* gravity */
+        particles[i].life -= dt * 0.8f;
+
+        /* React to treble */
+        particles[i].vx += (p->treble - 0.5f) * 0.2f;
+
+        int px = (int)particles[i].x;
+        int py = (int)particles[i].y;
+        if (px < 1 || px >= w-1 || py < 1 || py >= h-1) {
+            particles[i].life = 0;
+            continue;
+        }
+
+        float hue = particles[i].hue;
+        while (hue >= 360.0f) hue -= 360.0f;
+        while (hue < 0.0f) hue += 360.0f;
+        float brightness = particles[i].life;
+        uint8_t r, g, b;
+        hsv_fast(hue, 0.8f, brightness, &r, &g, &b);
+
+        /* Draw 3x3 soft particle */
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                float fade = (dx == 0 && dy == 0) ? 1.0f : 0.4f;
+                uint8_t *dest = buf + (py+dy) * pitch + (px+dx) * 4;
+                dest[0] = clamp8(dest[0] + (int)(b * fade));
+                dest[1] = clamp8(dest[1] + (int)(g * fade));
+                dest[2] = clamp8(dest[2] + (int)(r * fade));
+            }
         }
     }
 }
@@ -305,8 +531,9 @@ static void *Thread(void *p_data)
     auraviz_thread_t *p_thread = (auraviz_thread_t *)p_data;
     int canc = vlc_savecancel();
 
-    uint8_t *p_render_buf = malloc(p_thread->i_width * p_thread->i_height * 4);
-    if (!p_render_buf) {
+    /* Persistent frame buffer for effects that use trails */
+    uint8_t *p_prev = calloc(p_thread->i_width * p_thread->i_height, 4);
+    if (!p_prev) {
         vlc_restorecancel(canc);
         return NULL;
     }
@@ -336,15 +563,19 @@ static void *Thread(void *p_data)
         analyze_audio(p_thread, samples, i_nb_samples, p_thread->i_channels);
 
         float dt = (float)i_nb_samples / 44100.0f;
+        if (dt <= 0) dt = 0.02f;
         p_thread->time_acc += dt;
         p_thread->preset_time += dt;
+        p_thread->frame_count++;
 
-        if (p_thread->bass > 0.8f && p_thread->preset_time > 12.0f) {
-            p_thread->preset = (p_thread->preset + 1) % NUM_PRESETS;
+        /* Auto-switch preset on strong bass hits */
+        if (p_thread->bass > 0.85f && p_thread->preset_time > 15.0f) {
+            p_thread->preset = (p_thread->preset + 1) % 4;
             p_thread->preset_time = 0;
+            /* Clear trail buffer on preset switch */
+            memset(p_prev, 0, p_thread->i_width * p_thread->i_height * 4);
+            particles_init = false;
         }
-
-        render_frame(p_thread, p_render_buf);
 
         picture_t *p_pic = vout_GetPicture(p_thread->p_vout);
         if (unlikely(p_pic == NULL)) {
@@ -352,18 +583,36 @@ static void *Thread(void *p_data)
             continue;
         }
 
-        /* Copy row by row — p_pic pitch may differ from width*4 */
-        {
-            const int src_stride = p_thread->i_width * 4;
-            const int dst_pitch  = p_pic->p[0].i_pitch;
-            uint8_t *dst = p_pic->p[0].p_pixels;
-            const uint8_t *src = p_render_buf;
-            for (int y = 0; y < p_thread->i_height; y++) {
-                memcpy(dst, src, src_stride);
-                dst += dst_pitch;
-                src += src_stride;
-            }
+        int pic_pitch = p_pic->p[0].i_pitch;
+        uint8_t *pic_pixels = p_pic->p[0].p_pixels;
+        int w = p_thread->i_width;
+        int h = p_thread->i_height;
+
+        /* For trail effects, copy previous frame into picture first */
+        if (p_thread->preset >= 1) {
+            for (int y = 0; y < h; y++)
+                memcpy(pic_pixels + y * pic_pitch, p_prev + y * w * 4, w * 4);
         }
+
+        switch (p_thread->preset % 4) {
+            case 0:
+                render_spectrum(p_thread, pic_pixels, pic_pitch);
+                break;
+            case 1:
+                render_wave(p_thread, pic_pixels, pic_pitch,
+                           samples, i_nb_samples, p_thread->i_channels);
+                break;
+            case 2:
+                render_circular(p_thread, pic_pixels, pic_pitch);
+                break;
+            case 3:
+                render_particles(p_thread, pic_pixels, pic_pitch);
+                break;
+        }
+
+        /* Save frame for trail effects */
+        for (int y = 0; y < h; y++)
+            memcpy(p_prev + y * w * 4, pic_pixels + y * pic_pitch, w * 4);
 
         p_pic->date = p_block->i_pts + AURAVIZ_DELAY;
         vout_PutPicture(p_thread->p_vout, p_pic);
@@ -371,7 +620,7 @@ static void *Thread(void *p_data)
         block_Release(p_block);
     }
 
-    free(p_render_buf);
+    free(p_prev);
     vlc_restorecancel(canc);
     return NULL;
 }
