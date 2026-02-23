@@ -1,0 +1,77 @@
+name: Build AuraViz VLC Plugin
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install MinGW
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: false
+        install: >-
+          mingw-w64-x86_64-gcc
+          make
+          p7zip
+
+    - name: Download VLC SDK
+      shell: msys2 {0}
+      run: |
+        curl -L -o vlc.7z "https://download.videolan.org/vlc/last/win64/vlc-3.0.23-win64.7z"
+        7z x vlc.7z "vlc-3.0.23/sdk/*" -r -y
+        mv vlc-3.0.23/sdk ./vlc-sdk
+        rm -rf vlc-3.0.23 vlc.7z
+        
+        # Fix pkg-config paths
+        SDK_PATH=$(cd vlc-sdk && pwd -W | sed 's|\\|/|g')
+        sed -i "s|^prefix=.*|prefix=${SDK_PATH}|g" vlc-sdk/lib/pkgconfig/*.pc
+    
+    - name: Compile Plugin
+      shell: msys2 {0}
+      run: |
+        SDK_PATH=$(cd vlc-sdk && pwd -W | sed 's|\\|/|g')
+        export PKG_CONFIG_PATH="${SDK_PATH}/lib/pkgconfig"
+        
+        echo "=== VLC SDK Info ==="
+        pkg-config --cflags vlc-plugin
+        pkg-config --libs vlc-plugin
+        
+        echo "=== Compiling ==="
+        gcc -Wall -O2 -shared \
+            -DMODULE_STRING=\"auraviz\" \
+            $(pkg-config --cflags vlc-plugin) \
+            -o libauraviz_plugin.dll \
+            auraviz.c \
+            $(pkg-config --libs vlc-plugin) \
+            -lopengl32 -lm
+        
+        echo "=== Done ==="
+        ls -la libauraviz_plugin.dll
+
+    - name: Create Release Package
+      shell: msys2 {0}
+      run: |
+        mkdir -p release
+        cp libauraviz_plugin.dll release/
+        cp INSTALL.txt release/ 2>/dev/null || true
+        
+        # Check if the DLL needs any extra runtime DLLs
+        echo "=== DLL Dependencies ==="
+        objdump -p libauraviz_plugin.dll | grep "DLL Name" || true
+
+    - name: Upload Plugin DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: auraviz-vlc-plugin-win64
+        path: |
+          release/libauraviz_plugin.dll
+          release/INSTALL.txt
+        retention-days: 90
