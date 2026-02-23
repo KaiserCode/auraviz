@@ -1,10 +1,6 @@
 /*****************************************************************************
  * auraviz.c: AuraViz - Audio visualization plugin for VLC 3.0.x (Windows)
  *****************************************************************************
- * Renders audio-reactive visuals to a VLC vout (video output) window.
- * Uses CPU rendering with RGB32 pixel format (same as goom.c).
- * Appears under Audio → Visualizations in VLC.
- *
  * Modeled directly after vlc-3.0/modules/visualization/goom.c
  *
  * Copyright (C) 2025 AuraViz Contributors
@@ -13,6 +9,18 @@
 
 #ifdef HAVE_CONFIG_H
 # include "config.h"
+#endif
+
+/* On Windows, VLC's vlc_threads.h uses struct pollfd and poll().
+ * winsock2.h provides struct pollfd and WSAPoll.
+ * We define poll as WSAPoll BEFORE vlc headers so vlc_poll() works.
+ * Then VLC's vlc_threads.h will redefine poll() to vlc_poll() — that's fine. */
+#ifdef _WIN32
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# if !defined(poll)
+#  define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
+# endif
 #endif
 
 #include <vlc_common.h>
@@ -52,7 +60,7 @@ static int  Open  ( vlc_object_t * );
 static void Close ( vlc_object_t * );
 
 /*****************************************************************************
- * Module descriptor — matches goom.c from vlc-3.0
+ * Module descriptor
  *****************************************************************************/
 vlc_module_begin ()
     set_shortname( "AuraViz" )
@@ -67,7 +75,7 @@ vlc_module_begin ()
 vlc_module_end ()
 
 /*****************************************************************************
- * auraviz_thread_t — render thread data (matches goom_thread_t pattern)
+ * auraviz_thread_t
  *****************************************************************************/
 typedef struct
 {
@@ -81,12 +89,10 @@ typedef struct
     vlc_mutex_t lock;
     vlc_cond_t  wait;
 
-    /* Audio block queue — same approach as goom.c */
     block_t     *pp_blocks[MAX_BLOCKS];
     int          i_blocks;
     bool         b_exit;
 
-    /* Audio analysis state */
     float smooth_bands[NUM_BANDS];
     float bass, mid, treble, energy;
     float time_acc;
@@ -96,7 +102,7 @@ typedef struct
 } auraviz_thread_t;
 
 /*****************************************************************************
- * filter_sys_t — matches goom.c pattern
+ * filter_sys_t
  *****************************************************************************/
 struct filter_sys_t
 {
@@ -133,7 +139,7 @@ static void hsv2rgb(float h, float s, float v, uint8_t *r, uint8_t *g, uint8_t *
 }
 
 /*****************************************************************************
- * Audio analysis — simple DFT into frequency bands
+ * Audio analysis
  *****************************************************************************/
 static void analyze_audio(auraviz_thread_t *p_thread,
                           const float *samples,
@@ -178,7 +184,7 @@ static void analyze_audio(auraviz_thread_t *p_thread,
 }
 
 /*****************************************************************************
- * Rendering effects — write directly to RGB32 buffer (BGRA byte order)
+ * Rendering effects — RGB32 (BGRX byte order)
  *****************************************************************************/
 static void render_nebula(auraviz_thread_t *p, int px, int py, uint8_t *out)
 {
@@ -278,9 +284,6 @@ static const render_fn renderers[] = {
 };
 #define NUM_PRESETS (int)(sizeof(renderers)/sizeof(renderers[0]))
 
-/*****************************************************************************
- * Render to an RGB32 picture
- *****************************************************************************/
 static void render_frame(auraviz_thread_t *p, uint8_t *plane)
 {
     int w = p->i_width, h = p->i_height;
@@ -295,7 +298,7 @@ static void render_frame(auraviz_thread_t *p, uint8_t *plane)
 }
 
 /*****************************************************************************
- * Thread — modeled directly on goom.c Thread function
+ * Thread
  *****************************************************************************/
 static void *Thread(void *p_data)
 {
@@ -322,7 +325,6 @@ static void *Thread(void *p_data)
             break;
         }
 
-        /* Take the oldest block */
         p_block = p_thread->pp_blocks[0];
         i_nb_samples = p_block->i_nb_samples;
         p_thread->i_blocks--;
@@ -330,7 +332,6 @@ static void *Thread(void *p_data)
                 p_thread->i_blocks * sizeof(block_t *));
         vlc_mutex_unlock(&p_thread->lock);
 
-        /* Analyze audio */
         const float *samples = (const float *)p_block->p_buffer;
         analyze_audio(p_thread, samples, i_nb_samples, p_thread->i_channels);
 
@@ -338,23 +339,19 @@ static void *Thread(void *p_data)
         p_thread->time_acc += dt;
         p_thread->preset_time += dt;
 
-        /* Auto-switch preset on bass beat */
         if (p_thread->bass > 0.8f && p_thread->preset_time > 12.0f) {
             p_thread->preset = (p_thread->preset + 1) % NUM_PRESETS;
             p_thread->preset_time = 0;
         }
 
-        /* Render to buffer */
         render_frame(p_thread, p_render_buf);
 
-        /* Get a picture from vout — same as goom.c */
         picture_t *p_pic = vout_GetPicture(p_thread->p_vout);
         if (unlikely(p_pic == NULL)) {
             block_Release(p_block);
             continue;
         }
 
-        /* Copy rendered buffer to picture — same as goom.c */
         memcpy(p_pic->p[0].p_pixels, p_render_buf,
                p_thread->i_width * p_thread->i_height * 4);
 
@@ -370,7 +367,7 @@ static void *Thread(void *p_data)
 }
 
 /*****************************************************************************
- * DoWork: queue audio block — same pattern as goom.c DoWork
+ * DoWork
  *****************************************************************************/
 static block_t *DoWork(filter_t *p_filter, block_t *p_in_buf)
 {
@@ -397,7 +394,7 @@ static block_t *DoWork(filter_t *p_filter, block_t *p_in_buf)
 }
 
 /*****************************************************************************
- * Open — modeled directly on goom.c Open
+ * Open
  *****************************************************************************/
 static int Open(vlc_object_t *p_this)
 {
@@ -461,7 +458,7 @@ static int Open(vlc_object_t *p_this)
 }
 
 /*****************************************************************************
- * Close — modeled directly on goom.c Close
+ * Close
  *****************************************************************************/
 static void Close(vlc_object_t *p_this)
 {
