@@ -30,14 +30,14 @@ jobs:
         mv vlc-3.0.23/sdk ./vlc-sdk
         rm -rf vlc-3.0.23 vlc.7z
     
-    - name: Compile Plugin
+    - name: Compile Plugins
       shell: msys2 {0}
       run: |
         SDK_PATH=$(cd vlc-sdk && pwd)
         sed -i "s|^prefix=.*|prefix=${SDK_PATH}|g" vlc-sdk/lib/pkgconfig/*.pc
         export PKG_CONFIG_PATH="${SDK_PATH}/lib/pkgconfig"
         
-        echo "=== Compiling ==="
+        echo "=== Compiling auraviz (CPU) ==="
         gcc -Wall -O2 -shared -static-libgcc \
             -DMODULE_STRING=\"auraviz\" \
             $(pkg-config --cflags vlc-plugin) \
@@ -47,12 +47,24 @@ jobs:
             -lopengl32 -lm -lws2_32 \
             -Wl,-Bstatic -lpthread -Wl,-Bdynamic
         
+        echo "=== Compiling auraviz_gl (OpenGL) ==="
+        gcc -Wall -O2 -shared -static-libgcc \
+            -DMODULE_STRING=\"auraviz_gl\" \
+            $(pkg-config --cflags vlc-plugin) \
+            -o libauraviz_gl_plugin.dll \
+            auraviz_gl.c \
+            $(pkg-config --libs vlc-plugin) \
+            -lopengl32 -lm -lws2_32 \
+            -Wl,-Bstatic -lpthread -Wl,-Bdynamic
+        
         echo "=== Done ==="
-        ls -la libauraviz_plugin.dll
+        ls -la libauraviz_plugin.dll libauraviz_gl_plugin.dll
     
-    - name: Upload Plugin DLL
+    - name: Upload Plugin DLLs
       uses: actions/upload-artifact@v4
       with:
         name: auraviz-vlc-plugin-win64
-        path: libauraviz_plugin.dll
+        path: |
+          libauraviz_plugin.dll
+          libauraviz_gl_plugin.dll
         retention-days: 90
