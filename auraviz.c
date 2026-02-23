@@ -45,6 +45,7 @@
 #define VOUT_HEIGHT 500
 #define NUM_BANDS   64
 #define MAX_BLOCKS  100
+#define MAX_PARTICLES 300
 #define AURAVIZ_DELAY 400000
 
 #define WIDTH_TEXT "Video width"
@@ -92,6 +93,8 @@ typedef struct
     int          i_blocks;
     bool         b_exit;
 
+    int i_rate;             /* audio sample rate */
+
     /* Audio analysis results */
     float bands[NUM_BANDS];
     float smooth_bands[NUM_BANDS];
@@ -102,6 +105,14 @@ typedef struct
 
     int   preset;
     float preset_time;
+
+    /* Particle state (owned by thread, not file-scope static) */
+    struct {
+        float x, y, vx, vy;
+        float life;
+        float hue;
+    } particles[MAX_PARTICLES];
+    bool particles_init;
 } auraviz_thread_t;
 
 /*****************************************************************************
@@ -438,23 +449,13 @@ static void render_circular(auraviz_thread_t *p, uint8_t *buf, int pitch)
 /*****************************************************************************
  * EFFECT 4: Particle fountain
  *****************************************************************************/
-#define MAX_PARTICLES 300
-typedef struct {
-    float x, y, vx, vy;
-    float life;
-    float hue;
-} particle_t;
-
-static particle_t particles[MAX_PARTICLES];
-static bool particles_init = false;
-
 static void render_particles(auraviz_thread_t *p, uint8_t *buf, int pitch)
 {
     int w = p->i_width, h = p->i_height;
 
-    if (!particles_init) {
-        memset(particles, 0, sizeof(particles));
-        particles_init = true;
+    if (!p->particles_init) {
+        memset(p->particles, 0, sizeof(p->particles));
+        p->particles_init = true;
     }
 
     /* Fade background */
@@ -473,40 +474,40 @@ static void render_particles(auraviz_thread_t *p, uint8_t *buf, int pitch)
     /* Spawn particles based on energy */
     int spawn_count = (int)(p->energy * 15 + p->bass * 10);
     for (int i = 0; i < MAX_PARTICLES && spawn_count > 0; i++) {
-        if (particles[i].life <= 0) {
-            particles[i].x = w * 0.5f + (float)((p->frame_count * 7 + i * 13) % 200 - 100);
-            particles[i].y = h * 0.7f;
-            particles[i].vx = (float)((p->frame_count * 3 + i * 17) % 400 - 200) / 50.0f;
-            particles[i].vy = -(3.0f + p->bass * 8.0f + (float)((i * 31) % 100) / 25.0f);
-            particles[i].life = 1.0f;
-            particles[i].hue = p->time_acc * 40.0f + (float)(i % 60) * 6.0f;
+        if (p->particles[i].life <= 0) {
+            p->particles[i].x = w * 0.5f + (float)((p->frame_count * 7 + i * 13) % 200 - 100);
+            p->particles[i].y = h * 0.7f;
+            p->particles[i].vx = (float)((p->frame_count * 3 + i * 17) % 400 - 200) / 50.0f;
+            p->particles[i].vy = -(3.0f + p->bass * 8.0f + (float)((i * 31) % 100) / 25.0f);
+            p->particles[i].life = 1.0f;
+            p->particles[i].hue = p->time_acc * 40.0f + (float)(i % 60) * 6.0f;
             spawn_count--;
         }
     }
 
     /* Update and draw particles */
     for (int i = 0; i < MAX_PARTICLES; i++) {
-        if (particles[i].life <= 0) continue;
+        if (p->particles[i].life <= 0) continue;
 
-        particles[i].x += particles[i].vx;
-        particles[i].y += particles[i].vy;
-        particles[i].vy += 0.08f; /* gravity */
-        particles[i].life -= dt * 0.8f;
+        p->particles[i].x += p->particles[i].vx;
+        p->particles[i].y += p->particles[i].vy;
+        p->particles[i].vy += 0.08f; /* gravity */
+        p->particles[i].life -= dt * 0.8f;
 
         /* React to treble */
-        particles[i].vx += (p->treble - 0.5f) * 0.2f;
+        p->particles[i].vx += (p->treble - 0.5f) * 0.2f;
 
-        int px = (int)particles[i].x;
-        int py = (int)particles[i].y;
+        int px = (int)p->particles[i].x;
+        int py = (int)p->particles[i].y;
         if (px < 1 || px >= w-1 || py < 1 || py >= h-1) {
-            particles[i].life = 0;
+            p->particles[i].life = 0;
             continue;
         }
 
-        float hue = particles[i].hue;
+        float hue = p->particles[i].hue;
         while (hue >= 360.0f) hue -= 360.0f;
         while (hue < 0.0f) hue += 360.0f;
-        float brightness = particles[i].life;
+        float brightness = p->particles[i].life;
         uint8_t r, g, b;
         hsv_fast(hue, 0.8f, brightness, &r, &g, &b);
 
@@ -562,7 +563,7 @@ static void *Thread(void *p_data)
         const float *samples = (const float *)p_block->p_buffer;
         analyze_audio(p_thread, samples, i_nb_samples, p_thread->i_channels);
 
-        float dt = (float)i_nb_samples / 44100.0f;
+        float dt = (float)i_nb_samples / (float)p_thread->i_rate;
         if (dt <= 0) dt = 0.02f;
         p_thread->time_acc += dt;
         p_thread->preset_time += dt;
@@ -574,7 +575,7 @@ static void *Thread(void *p_data)
             p_thread->preset_time = 0;
             /* Clear trail buffer on preset switch */
             memset(p_prev, 0, p_thread->i_width * p_thread->i_height * 4);
-            particles_init = false;
+            p_thread->particles_init = false;
         }
 
         picture_t *p_pic = vout_GetPicture(p_thread->p_vout);
@@ -695,6 +696,7 @@ static int Open(vlc_object_t *p_this)
     p_thread->i_blocks = 0;
     p_thread->b_exit = false;
     p_thread->i_channels = aout_FormatNbChannels(&p_filter->fmt_in.audio);
+    p_thread->i_rate = p_filter->fmt_in.audio.i_rate;
 
     if (vlc_clone(&p_thread->thread, Thread, p_thread,
                   VLC_THREAD_PRIORITY_LOW))
