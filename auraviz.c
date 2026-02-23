@@ -15,13 +15,6 @@
 # include "config.h"
 #endif
 
-/* Fix Windows poll() issue — must come before VLC headers */
-#ifdef _WIN32
-# include <winsock2.h>
-# include <ws2tcpip.h>
-# define poll(fds, nfds, timeout) WSAPoll(fds, nfds, timeout)
-#endif
-
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
@@ -47,10 +40,10 @@
 #define MAX_BLOCKS  100
 #define AURAVIZ_DELAY 400000
 
-#define WIDTH_TEXT N_("Video width")
-#define WIDTH_LONGTEXT N_("The width of the visualization window, in pixels.")
-#define HEIGHT_TEXT N_("Video height")
-#define HEIGHT_LONGTEXT N_("The height of the visualization window, in pixels.")
+#define WIDTH_TEXT "Video width"
+#define WIDTH_LONGTEXT "The width of the visualization window, in pixels."
+#define HEIGHT_TEXT "Video height"
+#define HEIGHT_LONGTEXT "The height of the visualization window, in pixels."
 
 /*****************************************************************************
  * Prototypes
@@ -62,8 +55,8 @@ static void Close ( vlc_object_t * );
  * Module descriptor — matches goom.c from vlc-3.0
  *****************************************************************************/
 vlc_module_begin ()
-    set_shortname( N_("AuraViz") )
-    set_description( N_("AuraViz audio visualization") )
+    set_shortname( "AuraViz" )
+    set_description( "AuraViz audio visualization" )
     set_category( CAT_AUDIO )
     set_subcategory( SUBCAT_AUDIO_VISUAL )
     set_capability( "visualization", 0 )
@@ -207,7 +200,6 @@ static void render_nebula(auraviz_thread_t *p, int px, int py, uint8_t *out)
 
     uint8_t r, g, b;
     hsv2rgb(hue, sat, val, &r, &g, &b);
-    /* RGB32 in VLC is BGRX (little-endian XRGB) */
     out[0] = b; out[1] = g; out[2] = r; out[3] = 0xFF;
 }
 
@@ -287,8 +279,7 @@ static const render_fn renderers[] = {
 #define NUM_PRESETS (int)(sizeof(renderers)/sizeof(renderers[0]))
 
 /*****************************************************************************
- * Render to an RGB32 picture — writes directly into p_pic->p[0].p_pixels
- * Same approach as goom.c: memcpy into the single plane
+ * Render to an RGB32 picture
  *****************************************************************************/
 static void render_frame(auraviz_thread_t *p, uint8_t *plane)
 {
@@ -343,7 +334,7 @@ static void *Thread(void *p_data)
         const float *samples = (const float *)p_block->p_buffer;
         analyze_audio(p_thread, samples, i_nb_samples, p_thread->i_channels);
 
-        float dt = (float)i_nb_samples / 44100.0f; /* approximate */
+        float dt = (float)i_nb_samples / 44100.0f;
         p_thread->time_acc += dt;
         p_thread->preset_time += dt;
 
@@ -386,7 +377,6 @@ static block_t *DoWork(filter_t *p_filter, block_t *p_in_buf)
     filter_sys_t *p_sys = p_filter->p_sys;
     auraviz_thread_t *p_thread = p_sys->p_thread;
 
-    /* Duplicate the block and queue it */
     block_t *p_block = block_Alloc(p_in_buf->i_buffer);
     if (p_block) {
         memcpy(p_block->p_buffer, p_in_buf->p_buffer, p_in_buf->i_buffer);
@@ -419,7 +409,6 @@ static int Open(vlc_object_t *p_this)
     p_sys = p_filter->p_sys = malloc(sizeof(filter_sys_t));
     if (!p_sys) return VLC_ENOMEM;
 
-    /* Create thread data */
     p_sys->p_thread = p_thread = calloc(1, sizeof(*p_thread));
     if (!p_thread) {
         free(p_sys);
@@ -429,7 +418,6 @@ static int Open(vlc_object_t *p_this)
     const int width  = p_thread->i_width  = var_InheritInteger(p_filter, "auraviz-width");
     const int height = p_thread->i_height = var_InheritInteger(p_filter, "auraviz-height");
 
-    /* Set up video format — same as goom.c: RGB32, memset zero first */
     memset(&fmt, 0, sizeof(video_format_t));
 
     fmt.i_width = fmt.i_visible_width = width;
@@ -437,7 +425,6 @@ static int Open(vlc_object_t *p_this)
     fmt.i_chroma = VLC_CODEC_RGB32;
     fmt.i_sar_num = fmt.i_sar_den = 1;
 
-    /* Request vout — same API call as goom.c */
     p_thread->p_vout = aout_filter_RequestVout(p_filter, NULL, &fmt);
     if (p_thread->p_vout == NULL) {
         msg_Err(p_filter, "no suitable vout module");
@@ -446,7 +433,6 @@ static int Open(vlc_object_t *p_this)
         return VLC_EGENERIC;
     }
 
-    /* Init sync primitives — same as goom.c */
     vlc_mutex_init(&p_thread->lock);
     vlc_cond_init(&p_thread->wait);
 
@@ -454,7 +440,6 @@ static int Open(vlc_object_t *p_this)
     p_thread->b_exit = false;
     p_thread->i_channels = aout_FormatNbChannels(&p_filter->fmt_in.audio);
 
-    /* Launch thread — same as goom.c */
     if (vlc_clone(&p_thread->thread, Thread, p_thread,
                   VLC_THREAD_PRIORITY_LOW))
     {
@@ -467,7 +452,6 @@ static int Open(vlc_object_t *p_this)
         return VLC_EGENERIC;
     }
 
-    /* Set audio format and callback — same as goom.c */
     p_filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
     p_filter->fmt_out.audio = p_filter->fmt_in.audio;
     p_filter->pf_audio_filter = DoWork;
@@ -484,7 +468,6 @@ static void Close(vlc_object_t *p_this)
     filter_t *p_filter = (filter_t *)p_this;
     filter_sys_t *p_sys = p_filter->p_sys;
 
-    /* Signal thread to exit — same as goom.c */
     vlc_mutex_lock(&p_sys->p_thread->lock);
     p_sys->p_thread->b_exit = true;
     vlc_cond_signal(&p_sys->p_thread->wait);
@@ -492,11 +475,9 @@ static void Close(vlc_object_t *p_this)
 
     vlc_join(p_sys->p_thread->thread, NULL);
 
-    /* Free queued blocks — same as goom.c */
     for (int i = 0; i < p_sys->p_thread->i_blocks; i++)
         block_Release(p_sys->p_thread->pp_blocks[i]);
 
-    /* Release vout — same as goom.c */
     aout_filter_RequestVout(p_filter, p_sys->p_thread->p_vout, NULL);
 
     vlc_mutex_destroy(&p_sys->p_thread->lock);
