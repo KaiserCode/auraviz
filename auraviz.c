@@ -21,6 +21,8 @@
 #include <vlc_common.h>
 #include <vlc_plugin.h>
 #include <vlc_filter.h>
+#include <vlc_aout.h>
+#include <vlc_vout.h>
 #include <vlc_picture.h>
 #include <vlc_block.h>
 #include <vlc_picture_pool.h>
@@ -68,7 +70,7 @@ vlc_module_begin ()
 vlc_module_end ()
 
 /*****************************************************************************
- * Simple block queue (since vlc_queue.h is VLC 4.x only)
+ * Simple block queue (vlc_queue.h is VLC 4.x only)
  *****************************************************************************/
 typedef struct
 {
@@ -80,7 +82,7 @@ typedef struct
     bool        dead;
 } block_queue_t;
 
-static void block_queue_Init(block_queue_t *q)
+static void bq_Init(block_queue_t *q)
 {
     vlc_mutex_init(&q->lock);
     vlc_cond_init(&q->wait);
@@ -90,25 +92,19 @@ static void block_queue_Init(block_queue_t *q)
     q->dead = false;
 }
 
-static void block_queue_Destroy(block_queue_t *q)
+static void bq_Destroy(block_queue_t *q)
 {
-    /* Drain remaining blocks */
     block_t *b = q->first;
-    while (b) {
-        block_t *next = b->p_next;
-        block_Release(b);
-        b = next;
-    }
+    while (b) { block_t *n = b->p_next; block_Release(b); b = n; }
     vlc_mutex_destroy(&q->lock);
     vlc_cond_destroy(&q->wait);
 }
 
-static void block_queue_Enqueue(block_queue_t *q, block_t *block)
+static void bq_Enqueue(block_queue_t *q, block_t *block)
 {
     block->p_next = NULL;
     vlc_mutex_lock(&q->lock);
     if (q->count >= QUEUE_MAX) {
-        /* Drop oldest if full */
         block_t *old = q->first;
         q->first = old->p_next;
         if (!q->first) q->lastp = &q->first;
@@ -122,18 +118,15 @@ static void block_queue_Enqueue(block_queue_t *q, block_t *block)
     vlc_mutex_unlock(&q->lock);
 }
 
-/* Returns NULL when killed */
-static block_t *block_queue_Dequeue(block_queue_t *q)
+static block_t *bq_Dequeue(block_queue_t *q)
 {
     vlc_mutex_lock(&q->lock);
     while (!q->first && !q->dead)
         vlc_cond_wait(&q->wait, &q->lock);
-
     if (q->dead && !q->first) {
         vlc_mutex_unlock(&q->lock);
         return NULL;
     }
-
     block_t *b = q->first;
     q->first = b->p_next;
     if (!q->first) q->lastp = &q->first;
@@ -143,7 +136,7 @@ static block_t *block_queue_Dequeue(block_queue_t *q)
     return b;
 }
 
-static void block_queue_Kill(block_queue_t *q)
+static void bq_Kill(block_queue_t *q)
 {
     vlc_mutex_lock(&q->lock);
     q->dead = true;
@@ -154,30 +147,24 @@ static void block_queue_Kill(block_queue_t *q)
 /*****************************************************************************
  * Internal data
  *****************************************************************************/
-struct filter_sys_t
+typedef struct
 {
-    /* Video output */
     vout_thread_t  *p_vout;
     picture_pool_t *pool;
 
-    /* Threading */
     vlc_thread_t   thread;
     block_queue_t  queue;
 
-    /* Config */
     int width;
     int height;
 
-    /* Audio analysis */
-    float bands[NUM_BANDS];
     float smooth_bands[NUM_BANDS];
     float bass, mid, treble, energy;
     float time_acc;
 
-    /* Preset */
     int   preset;
     float preset_time;
-};
+} filter_sys_t;
 
 /*****************************************************************************
  * Color helpers
@@ -253,9 +240,8 @@ static void analyze_audio(filter_sys_t *sys, const float *samples,
 }
 
 /*****************************************************************************
- * Rendering — pixel-level effects into YUV buffer
+ * Rendering effects
  *****************************************************************************/
-
 static void render_nebula(filter_sys_t *sys, int px, int py,
                           uint8_t *r, uint8_t *g, uint8_t *b)
 {
@@ -386,20 +372,20 @@ static void render_frame(filter_sys_t *sys, picture_t *pic)
  *****************************************************************************/
 static void *Thread(void *data)
 {
-    filter_t *filter = (filter_t *)data;
-    filter_sys_t *sys = filter->p_sys;
+    filter_t *p_filter = (filter_t *)data;
+    filter_sys_t *sys = (filter_sys_t *)p_filter->p_sys;
     block_t *block;
 
-    while ((block = block_queue_Dequeue(&sys->queue)) != NULL)
+    while ((block = bq_Dequeue(&sys->queue)) != NULL)
     {
         const float *samples = (const float *)block->p_buffer;
         int nb_samples = block->i_nb_samples;
-        int channels = aout_FormatNbChannels(&filter->fmt_in.audio);
+        int channels = aout_FormatNbChannels(&p_filter->fmt_in.audio);
 
         analyze_audio(sys, samples, nb_samples, channels);
 
-        sys->time_acc += (float)nb_samples / (float)filter->fmt_in.audio.i_rate;
-        sys->preset_time += (float)nb_samples / (float)filter->fmt_in.audio.i_rate;
+        sys->time_acc += (float)nb_samples / (float)p_filter->fmt_in.audio.i_rate;
+        sys->preset_time += (float)nb_samples / (float)p_filter->fmt_in.audio.i_rate;
 
         if (sys->bass > 0.8f && sys->preset_time > 12.0f) {
             sys->preset = (sys->preset + 1) % NUM_PRESETS;
@@ -420,39 +406,30 @@ static void *Thread(void *data)
 }
 
 /*****************************************************************************
- * Filter callback
+ * Filter callback — VLC 3.0 uses pf_audio_filter function pointer
  *****************************************************************************/
-static block_t *DoWork(filter_t *filter, block_t *block)
+static block_t *DoWork(filter_t *p_filter, block_t *block)
 {
-    filter_sys_t *sys = filter->p_sys;
+    filter_sys_t *sys = (filter_sys_t *)p_filter->p_sys;
     block_t *dup = block_Duplicate(block);
     if (dup)
-        block_queue_Enqueue(&sys->queue, dup);
+        bq_Enqueue(&sys->queue, dup);
     return block;
 }
 
-static void Flush(filter_t *filter)
-{
-    (void)filter;
-}
-
-static const struct vlc_filter_operations filter_ops = {
-    .filter_audio = DoWork,
-    .flush = Flush,
-};
-
 /*****************************************************************************
- * Open / Close
+ * Open
  *****************************************************************************/
 static int Open(vlc_object_t *obj)
 {
-    filter_t *filter = (filter_t *)obj;
+    filter_t *p_filter = (filter_t *)obj;
     filter_sys_t *sys = calloc(1, sizeof(*sys));
     if (!sys) return VLC_ENOMEM;
 
-    sys->width  = var_InheritInteger(filter, "auraviz-width");
-    sys->height = var_InheritInteger(filter, "auraviz-height");
+    sys->width  = var_InheritInteger(p_filter, "auraviz-width");
+    sys->height = var_InheritInteger(p_filter, "auraviz-height");
 
+    /* Create video format */
     video_format_t fmt;
     video_format_Init(&fmt, VLC_CODEC_I420);
     fmt.i_width = fmt.i_visible_width = sys->width;
@@ -460,51 +437,59 @@ static int Open(vlc_object_t *obj)
     fmt.i_sar_num = 1;
     fmt.i_sar_den = 1;
 
+    /* Allocate picture pool */
     sys->pool = picture_pool_NewFromFormat(&fmt, 3);
     if (!sys->pool) {
-        msg_Err(filter, "Failed to create picture pool");
+        msg_Err(p_filter, "Failed to create picture pool");
         free(sys);
         return VLC_EGENERIC;
     }
 
-    sys->p_vout = aout_filter_GetVout(filter, &fmt);
+    /* Open video output — VLC 3.0 API */
+    sys->p_vout = aout_filter_RequestVout(p_filter, NULL, &fmt);
     if (!sys->p_vout) {
-        msg_Err(filter, "Failed to open video output");
+        msg_Err(p_filter, "Failed to open video output");
         picture_pool_Release(sys->pool);
         free(sys);
         return VLC_EGENERIC;
     }
 
-    block_queue_Init(&sys->queue);
-    filter->p_sys = sys;
+    bq_Init(&sys->queue);
+    p_filter->p_sys = (filter_sys_t *)sys;
 
-    if (vlc_clone(&sys->thread, Thread, filter, VLC_THREAD_PRIORITY_LOW)) {
-        msg_Err(filter, "Failed to create thread");
-        vout_Close(sys->p_vout);
+    if (vlc_clone(&sys->thread, Thread, p_filter, VLC_THREAD_PRIORITY_LOW)) {
+        msg_Err(p_filter, "Failed to create thread");
+        aout_filter_RequestVout(p_filter, sys->p_vout, NULL);
         picture_pool_Release(sys->pool);
-        block_queue_Destroy(&sys->queue);
+        bq_Destroy(&sys->queue);
         free(sys);
         return VLC_EGENERIC;
     }
 
-    filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
-    filter->fmt_out.audio = filter->fmt_in.audio;
-    filter->ops = &filter_ops;
+    /* VLC 3.0: set format and callback via function pointer */
+    p_filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
+    aout_FormatPrepare(&p_filter->fmt_in.audio);
+    p_filter->fmt_out.audio = p_filter->fmt_in.audio;
+    p_filter->pf_audio_filter = DoWork;
 
-    msg_Info(filter, "AuraViz visualization started");
+    msg_Info(p_filter, "AuraViz visualization started");
     return VLC_SUCCESS;
 }
 
+/*****************************************************************************
+ * Close
+ *****************************************************************************/
 static void Close(vlc_object_t *obj)
 {
-    filter_t *filter = (filter_t *)obj;
-    filter_sys_t *sys = filter->p_sys;
+    filter_t *p_filter = (filter_t *)obj;
+    filter_sys_t *sys = (filter_sys_t *)p_filter->p_sys;
 
-    block_queue_Kill(&sys->queue);
+    bq_Kill(&sys->queue);
     vlc_join(sys->thread, NULL);
 
-    vout_Close(sys->p_vout);
+    /* Release vout — VLC 3.0: pass vout as second arg, NULL as third to close */
+    aout_filter_RequestVout(p_filter, sys->p_vout, NULL);
     picture_pool_Release(sys->pool);
-    block_queue_Destroy(&sys->queue);
+    bq_Destroy(&sys->queue);
     free(sys);
 }
