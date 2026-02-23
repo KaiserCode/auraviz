@@ -41,7 +41,7 @@
 #define MAX_BLOCKS  100
 #define MAX_PARTICLES 300
 #define AURAVIZ_DELAY 400000
-#define NUM_PRESETS  10
+#define NUM_PRESETS  20
 #define HALF_DIV 2
 
 #define WIDTH_TEXT "Video width"
@@ -49,7 +49,7 @@
 #define HEIGHT_TEXT "Video height"
 #define HEIGHT_LONGTEXT "The height of the visualization window, in pixels."
 #define PRESET_TEXT "Visual preset"
-#define PRESET_LONGTEXT "0=auto-cycle, 1-10=specific preset"
+#define PRESET_LONGTEXT "0=auto-cycle, 1-20=specific preset"
 
 static int  Open  ( vlc_object_t * );
 static void Close ( vlc_object_t * );
@@ -119,6 +119,30 @@ static inline void hsv_fast(float h, float s, float v,
         case 4: *r=t; *g=p2; *b=V; break;
         default: *r=V; *g=p2; *b=q; break;
     }
+}
+
+/* Simple hash-based noise for shader effects */
+static inline float noise2d(float x, float y)
+{
+    int ix = (int)floorf(x), iy = (int)floorf(y);
+    float fx = x - ix, fy = y - iy;
+    fx = fx * fx * (3 - 2 * fx);
+    fy = fy * fy * (3 - 2 * fy);
+    unsigned int h = ix * 374761393u + iy * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    float a = (float)(h & 0xFFFF) / 65535.0f;
+    h = (ix+1) * 374761393u + iy * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    float b2 = (float)(h & 0xFFFF) / 65535.0f;
+    h = ix * 374761393u + (iy+1) * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    float c = (float)(h & 0xFFFF) / 65535.0f;
+    h = (ix+1) * 374761393u + (iy+1) * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    float d = (float)(h & 0xFFFF) / 65535.0f;
+    float ab = a + (b2 - a) * fx;
+    float cd = c + (d - c) * fx;
+    return ab + (cd - ab) * fy;
 }
 
 static void analyze_audio(auraviz_thread_t *p, const float *samples,
@@ -445,6 +469,274 @@ static void render_starburst_half(auraviz_thread_t *p, uint8_t *hb, int hw, int 
     }
 }
 
+
+/* ======== PRESET 10: Electric Storm ======== */
+static void render_storm_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    for(int py=0; py<hh; py++){
+        float y = ((float)py/hh - 0.5f) * 2;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = ((float)px/hw - 0.5f) * 2 * ((float)hw/hh);
+            float dist = sqrtf(x*x + y*y) + 0.001f;
+            float angle = atan2f(y, x);
+            float bolt = 0;
+            for(int arm = 0; arm < 8; arm++){
+                float aa = arm * (float)M_PI * 0.25f + t * 0.3f;
+                float diff = angle - aa;
+                while(diff > M_PI) diff -= 2*M_PI;
+                while(diff < -M_PI) diff += 2*M_PI;
+                float width = 0.03f + noise2d(dist*8+t*2, arm*10.0f) * 0.05f * p->energy;
+                float arm_val = expf(-diff*diff / (width*width));
+                float jag = noise2d(dist*15 + arm*5, t*4 + arm) * 0.3f;
+                arm_val *= (1.0f - dist*0.5f + jag);
+                bolt += arm_val * p->smooth_bands[arm*8 % NUM_BANDS] * 6;
+            }
+            if(bolt > 1) bolt = 1;
+            float flash = p->bass > 0.7f ? (p->bass - 0.7f) * 3.0f / (dist*4+0.5f) : 0;
+            float val = bolt + flash; if(val > 1) val = 1;
+            float hue = fmodf(200 + bolt*60 + dist*30, 360);
+            uint8_t r,g,b; hsv_fast(hue, 0.6f - bolt*0.4f, val, &r, &g, &b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 11: Ripple Pool ======== */
+static void render_ripple_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    float cx[4], cy[4];
+    cx[0]=0.3f+sinf(t*0.5f)*0.15f; cy[0]=0.3f+cosf(t*0.4f)*0.15f;
+    cx[1]=0.7f+cosf(t*0.6f)*0.15f; cy[1]=0.3f+sinf(t*0.5f)*0.15f;
+    cx[2]=0.5f+sinf(t*0.3f)*0.2f;  cy[2]=0.7f+cosf(t*0.7f)*0.1f;
+    cx[3]=0.5f; cy[3]=0.5f;
+    for(int py=0; py<hh; py++){
+        float y = (float)py/hh;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = (float)px/hw;
+            float wave = 0;
+            for(int i=0; i<4; i++){
+                float dx=x-cx[i], dy=y-cy[i], d=sqrtf(dx*dx+dy*dy);
+                float freq = 20+i*8+p->smooth_bands[i*16%NUM_BANDS]*30;
+                wave += sinf(d*freq - t*4 - i*1.5f) * (1.0f/(d*8+1));
+            }
+            wave = wave*0.25f + 0.5f;
+            float hue = fmodf(wave*180+t*20, 360);
+            float val = 0.2f+wave*0.6f+p->bass*0.2f; if(val>1)val=1; if(val<0)val=0;
+            uint8_t r,g,b; hsv_fast(hue, 0.7f+0.3f*p->energy, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 12: Fractal Warp ======== */
+static void render_fractalwarp_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.4f;
+    for(int py=0; py<hh; py++){
+        float y = ((float)py/hh-0.5f)*3;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = ((float)px/hw-0.5f)*3*((float)hw/hh);
+            float wx = x + noise2d(x+t, y)*0.8f*(1+p->bass);
+            float wy = y + noise2d(x, y+t)*0.8f*(1+p->mid);
+            float wx2 = wx + noise2d(wx*2+t*0.5f, wy*2)*0.4f*p->energy;
+            float wy2 = wy + noise2d(wx*2, wy*2-t*0.5f)*0.4f*p->energy;
+            float n = noise2d(wx2*3, wy2*3);
+            float hue = fmodf(n*360+t*30+p->treble*60, 360);
+            float val = n*0.6f+0.3f+p->energy*0.2f; if(val>1)val=1;
+            uint8_t r,g,b; hsv_fast(hue, 0.75f, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 13: Spiral Galaxy ======== */
+static void render_galaxy_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc*0.2f;
+    for(int py=0; py<hh; py++){
+        float y = ((float)py/hh-0.5f)*2;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = ((float)px/hw-0.5f)*2*((float)hw/hh);
+            float dist = sqrtf(x*x+y*y)+0.001f, angle = atan2f(y,x);
+            float spiral = sinf(angle*2 - logf(dist)*4 + t*3)*0.5f+0.5f;
+            float spiral2 = sinf(angle*2 - logf(dist)*4 + t*3 + M_PI)*0.5f+0.5f;
+            float arm = fmaxf(spiral, spiral2);
+            arm = powf(arm, 2.0f - p->bass);
+            float core = expf(-dist*dist*4) * (1+p->bass*2);
+            float val = arm*(0.3f+0.7f/(dist*3+0.5f)) + core; if(val>1)val=1;
+            float hue = fmodf(angle*57.3f+dist*100+t*40, 360);
+            uint8_t r,g,b; hsv_fast(hue, 0.6f+0.4f*(1-core), val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 14: Glitch Matrix ======== */
+static void render_glitch_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    unsigned int seed = (unsigned int)(t*7) * 2654435761u;
+    for(int py=0; py<hh; py++){
+        float y = (float)py/hh;
+        float offset = 0;
+        unsigned int lh = (seed + py*371) ^ (py*1723);
+        lh = (lh>>13) ^ lh;
+        if((lh & 0xFF) < (int)(p->bass*60))
+            offset = ((float)(lh & 0xFFF)/4096.0f - 0.5f)*0.3f*p->bass;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = (float)px/hw + offset;
+            float gx = fmodf(fabsf(x*20+t*2), 1.0f);
+            float gy = fmodf(fabsf(y*20+t*0.5f), 1.0f);
+            float grid = (gx<0.05f||gy<0.05f) ? 0.8f : 0;
+            int band = (int)(fabsf(x)*NUM_BANDS) % NUM_BANDS;
+            float bval = p->smooth_bands[band]*5; if(bval>1)bval=1;
+            float bar = (1.0f-y) < bval ? bval : 0;
+            float val = fmaxf(grid*p->energy, bar*0.7f); if(val>1)val=1;
+            float hue = 120 + bval*60 + grid*40;
+            uint8_t r,g,b; hsv_fast(hue, 0.8f, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 15: Aurora Borealis ======== */
+static void render_aurora_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc*0.3f;
+    for(int py=0; py<hh; py++){
+        float y = (float)py/hh;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = (float)px/hw;
+            float curtain = 0;
+            for(int layer=0; layer<3; layer++){
+                float lx = x*3 + layer*0.5f;
+                float wave = sinf(lx*2+t*(1+layer*0.3f)+p->bass*3)*0.5f
+                    + sinf(lx*5+t*1.5f+layer)*0.3f + noise2d(lx+t*0.5f, layer*10.0f)*0.2f;
+                float center = 0.3f + wave*0.15f + layer*0.05f;
+                float dist = fabsf(y - center);
+                curtain += expf(-dist*dist*80) * (0.5f+p->smooth_bands[layer*20%NUM_BANDS]*3);
+            }
+            if(curtain>1) curtain=1;
+            float sky = 0.02f + y*0.03f;
+            float val = fmaxf(curtain, sky); if(val>1)val=1;
+            float hue = fmodf(100+curtain*80+x*30+t*10, 360);
+            uint8_t r,g,b; hsv_fast(hue, curtain>0.1f?0.8f:0.3f, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 16: Pulse Grid ======== */
+static void render_pulsegrid_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    for(int py=0; py<hh; py++){
+        float y = ((float)py/hh-0.5f)*2;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = ((float)px/hw-0.5f)*2*((float)hw/hh);
+            float z = 1.0f/(fabsf(y)+0.1f);
+            float gx2 = x*z, gz = z - t*3;
+            float lx = fmodf(fabsf(gx2), 1.0f), lz = fmodf(fabsf(gz), 1.0f);
+            float line = (lx<0.05f||lz<0.05f) ? 1.0f : 0;
+            float pulse = sinf(gz*0.5f+t*2+p->bass*4)*0.5f+0.5f;
+            float val = line*(0.3f+pulse*0.5f+p->energy*0.2f);
+            val *= 1.0f/(fabsf(y)*2+0.5f);
+            if(val>1)val=1; if(val<0)val=0;
+            float hue = fmodf(gz*20+t*30+pulse*60, 360);
+            uint8_t r,g,b; hsv_fast(hue, 0.7f+0.3f*line, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 17: Fire ======== */
+static void render_fire_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    for(int py=0; py<hh; py++){
+        float y = (float)py/hh;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = (float)px/hw;
+            float n1 = noise2d(x*6, y*4-t*2);
+            float n2 = noise2d(x*12+3, y*8-t*3)*0.5f;
+            float n3 = noise2d(x*24+7, y*16-t*5)*0.25f;
+            float flame = (n1+n2+n3) * (1.0f-y)*(1.0f-y)*1.5f + p->bass*(1.0f-y)*0.3f;
+            if(flame>1)flame=1; if(flame<0)flame=0;
+            uint8_t r,g,b;
+            if(flame<0.25f){ r=clamp8((int)(flame*4*180)); g=0; b=0; }
+            else if(flame<0.5f){ float f2=(flame-0.25f)*4; r=clamp8(180+(int)(f2*75)); g=clamp8((int)(f2*130)); b=0; }
+            else if(flame<0.75f){ float f2=(flame-0.5f)*4; r=255; g=clamp8(130+(int)(f2*125)); b=clamp8((int)(f2*50)); }
+            else { float f2=(flame-0.75f)*4; r=255; g=255; b=clamp8(50+(int)(f2*205)); }
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 18: Diamond Rain ======== */
+static void render_diamonds_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    memset(hb, 0, hw*hh*4);
+    for(int py=0; py<hh; py++){
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x=(float)px/hw, y=(float)py/hh;
+            float val=0, hue=0;
+            for(int col=0; col<30; col++){
+                float cx2 = (float)col/30 + 0.0167f;
+                float dx = x - cx2;
+                if(fabsf(dx) > 0.03f) continue;
+                float speed = 1.5f + (col%7)*0.4f + p->smooth_bands[col*2%NUM_BANDS]*3;
+                float yoff = fmodf(y + t*speed + col*0.37f, 1.2f);
+                float size = 0.01f + p->energy*0.008f;
+                float head = fabsf(dx) + fabsf(yoff-0.1f);
+                if(head < size){ val=fmaxf(val, 1.0f-head/size); hue=fmodf(col*30+t*20, 360); }
+                if(yoff>0.1f && yoff<0.5f && fabsf(dx)<0.004f)
+                    val = fmaxf(val, (0.5f-yoff)/0.4f*0.3f);
+            }
+            if(val>1)val=1;
+            uint8_t r,g,b; hsv_fast(hue, 0.5f, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 19: Vortex ======== */
+static void render_vortex_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc*0.5f;
+    for(int py=0; py<hh; py++){
+        float y = ((float)py/hh-0.5f)*2;
+        uint8_t *row = hb + py*hw*4;
+        for(int px=0; px<hw; px++){
+            float x = ((float)px/hw-0.5f)*2*((float)hw/hh);
+            float dist = sqrtf(x*x+y*y)+0.001f, angle = atan2f(y,x);
+            float twist = t*3 + (1.0f/dist)*(1+p->bass*2);
+            float ta = angle + twist;
+            float spiral = sinf(ta*4+dist*10)*0.5f+0.5f;
+            float rings = sinf(dist*20-t*6+p->mid*4)*0.5f+0.5f;
+            float pattern = spiral*0.6f + rings*0.4f;
+            float val = pattern*(0.4f+0.6f/(dist*2+0.3f));
+            val += expf(-dist*dist*8)*p->bass*0.5f;
+            if(val>1)val=1;
+            float hue = fmodf(ta*57.3f+dist*60+t*20, 360);
+            uint8_t r,g,b; hsv_fast(hue, 0.7f+0.3f*p->energy, val, &r,&g,&b);
+            put_pixel(row+px*4, r, g, b);
+        }
+    }
+}
+
+
 /* ======== Thread ======== */
 static void *Thread(void *p_data)
 {
@@ -515,6 +807,27 @@ static void *Thread(void *p_data)
                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
             case 9: render_starburst_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 10: render_storm_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 11: render_ripple_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 12: render_fractalwarp_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 13: render_galaxy_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 14: render_glitch_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 15: render_aurora_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 16: render_pulsegrid_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 17: render_fire_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 18: render_diamonds_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 19: render_vortex_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+
         }
 
         for (int y = 0; y < h; y++)
