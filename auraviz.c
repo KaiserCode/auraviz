@@ -352,8 +352,18 @@ static void *Thread(void *p_data)
             continue;
         }
 
-        memcpy(p_pic->p[0].p_pixels, p_render_buf,
-               p_thread->i_width * p_thread->i_height * 4);
+        /* Copy row by row — p_pic pitch may differ from width*4 */
+        {
+            const int src_stride = p_thread->i_width * 4;
+            const int dst_pitch  = p_pic->p[0].i_pitch;
+            uint8_t *dst = p_pic->p[0].p_pixels;
+            const uint8_t *src = p_render_buf;
+            for (int y = 0; y < p_thread->i_height; y++) {
+                memcpy(dst, src, src_stride);
+                dst += dst_pitch;
+                src += src_stride;
+            }
+        }
 
         p_pic->date = p_block->i_pts + AURAVIZ_DELAY;
         vout_PutPicture(p_thread->p_vout, p_pic);
