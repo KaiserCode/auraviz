@@ -51,6 +51,10 @@
 #define HEIGHT_LONGTEXT "The height of the visualization window, in pixels."
 #define PRESET_TEXT "Visual preset"
 #define PRESET_LONGTEXT "0=auto-cycle, 1-20=specific preset"
+#define GAIN_TEXT "Audio gain"
+#define GAIN_LONGTEXT "Sensitivity of audio response (0=low, 100=high, 50=default)"
+#define SMOOTH_TEXT "Smoothing"
+#define SMOOTH_LONGTEXT "Smoothness of visual transitions (0=sharp, 100=smooth, 50=default)"
 
 static int  Open  ( vlc_object_t * );
 static void Close ( vlc_object_t * );
@@ -64,6 +68,10 @@ vlc_module_begin ()
     add_integer( "auraviz-width",  VOUT_WIDTH,  WIDTH_TEXT,  WIDTH_LONGTEXT, false )
     add_integer( "auraviz-height", VOUT_HEIGHT, HEIGHT_TEXT, HEIGHT_LONGTEXT, false )
     add_integer( "auraviz-preset", 0, PRESET_TEXT, PRESET_LONGTEXT, false )
+    add_integer( "auraviz-gain", 50, GAIN_TEXT, GAIN_LONGTEXT, false )
+        change_integer_range( 0, 100 )
+    add_integer( "auraviz-smooth", 50, SMOOTH_TEXT, SMOOTH_LONGTEXT, false )
+        change_integer_range( 0, 100 )
     set_callbacks( Open, Close )
     add_shortcut( "auraviz" )
 vlc_module_end ()
@@ -88,6 +96,8 @@ typedef struct
     unsigned int frame_count;
     int   preset;
     int   user_preset;
+    int   gain;      /* 0-100, default 50 */
+    int   smooth;    /* 0-100, default 50 */
     float preset_time;
     struct { float x, y, vx, vy, life, hue; } particles[MAX_PARTICLES];
     bool particles_init;
@@ -197,19 +207,25 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
         p->agc_peak *= 0.995f;  /* decay ~0.5% per frame */
     if (p->agc_peak < 0.0001f) p->agc_peak = 0.0001f;
 
-    /* Normalize bands relative to AGC peak, apply dB-like curve */
+    /* User-adjustable gain: 0-100 maps to 0.5x - 8x multiplier */
+    float gain_mult = 0.5f + (p->gain / 100.0f) * 7.5f;
+
+    /* User-adjustable smoothing: 0-100 maps attack/release curves */
+    float smooth_pct = p->smooth / 100.0f;
+    float attack  = 0.9f - smooth_pct * 0.5f;   /* 0.9 (sharp) to 0.4 (smooth) */
+    float release = 0.05f + smooth_pct * 0.25f;  /* 0.05 (sharp) to 0.3 (smooth) */
+
+    /* Normalize bands relative to AGC peak, apply gain */
     for (int band = 0; band < NUM_BANDS; band++) {
-        /* Normalize to 0-1 range using AGC */
         float norm = raw_mag[band] / p->agc_peak;
+        float val = sqrtf(norm) * gain_mult;
+        if (val > 1.0f) val = 1.0f;
 
-        /* Apply power curve for more dynamic range (sqrt gives ~dB feel) */
-        float val = sqrtf(norm);
-
-        /* Smooth: fast attack, gradual release */
+        /* Smooth: user-controlled attack/release */
         if (val > p->smooth_bands[band])
-            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.6f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * attack;
         else
-            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.18f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * release;
 
         p->bands[band] = val;
         if (p->smooth_bands[band] > p->peak_bands[band])
@@ -226,10 +242,11 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
     for (int i = 2*b3; i < NUM_BANDS; i++) treble += p->smooth_bands[i];
     bass /= b3; mid /= b3; treble /= (NUM_BANDS - 2*b3);
 
-    /* Responsive but smooth */
-    p->bass += (bass - p->bass) * 0.45f;
-    p->mid += (mid - p->mid) * 0.45f;
-    p->treble += (treble - p->treble) * 0.45f;
+    /* Bass/mid/treble smoothing controlled by user smooth setting */
+    float bmt_smooth = 0.7f - smooth_pct * 0.45f;  /* 0.7 (sharp) to 0.25 (smooth) */
+    p->bass += (bass - p->bass) * bmt_smooth;
+    p->mid += (mid - p->mid) * bmt_smooth;
+    p->treble += (treble - p->treble) * bmt_smooth;
     p->energy = (p->bass + p->mid + p->treble) / 3.0f;
 }
 
@@ -818,6 +835,8 @@ static void *Thread(void *p_data)
             memset(p_prev, 0, p_thread->i_width * p_thread->i_height * 4);
             p_thread->particles_init = false;
         }
+        p_thread->gain = config_GetInt(p_thread->p_obj, "auraviz-gain");
+        p_thread->smooth = config_GetInt(p_thread->p_obj, "auraviz-smooth");
 
         int active;
         if (p_thread->user_preset > 0 && p_thread->user_preset <= NUM_PRESETS)
@@ -967,6 +986,8 @@ static int Open(vlc_object_t *p_this)
     p_thread->b_exit = false;
     p_thread->i_channels = aout_FormatNbChannels(&p_filter->fmt_in.audio);
     p_thread->i_rate = p_filter->fmt_in.audio.i_rate;
+    p_thread->gain = var_InheritInteger(p_this, "auraviz-gain");
+    p_thread->smooth = var_InheritInteger(p_this, "auraviz-smooth");
 
     if (vlc_clone(&p_thread->thread, Thread, p_thread, VLC_THREAD_PRIORITY_LOW)) {
         msg_Err(p_filter, "cannot launch auraviz thread");
