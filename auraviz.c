@@ -205,11 +205,11 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
         /* Apply power curve for more dynamic range (sqrt gives ~dB feel) */
         float val = sqrtf(norm);
 
-        /* Smooth: fast attack, medium release */
+        /* Smooth: fast attack, gradual release */
         if (val > p->smooth_bands[band])
-            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.7f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.6f;
         else
-            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.3f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.18f;
 
         p->bands[band] = val;
         if (p->smooth_bands[band] > p->peak_bands[band])
@@ -226,10 +226,10 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
     for (int i = 2*b3; i < NUM_BANDS; i++) treble += p->smooth_bands[i];
     bass /= b3; mid /= b3; treble /= (NUM_BANDS - 2*b3);
 
-    /* Fast smoothing so beats come through */
-    p->bass += (bass - p->bass) * 0.6f;
-    p->mid += (mid - p->mid) * 0.6f;
-    p->treble += (treble - p->treble) * 0.6f;
+    /* Responsive but smooth */
+    p->bass += (bass - p->bass) * 0.45f;
+    p->mid += (mid - p->mid) * 0.45f;
+    p->treble += (treble - p->treble) * 0.45f;
     p->energy = (p->bass + p->mid + p->treble) / 3.0f;
 }
 
@@ -882,6 +882,18 @@ static void *Thread(void *p_data)
             case 19: render_vortex_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
                      upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
 
+        }
+
+        /* Frame blending: mix 80% current + 20% previous for smooth motion */
+        for (int y = 0; y < h; y++) {
+            uint8_t *cur = pix + y * pp;
+            uint8_t *prev = p_prev + y * w * 4;
+            for (int x = 0; x < w; x++) {
+                int i = x * 4;
+                cur[i]   = (uint8_t)((cur[i]   * 205 + prev[i]   * 50) >> 8);
+                cur[i+1] = (uint8_t)((cur[i+1] * 205 + prev[i+1] * 50) >> 8);
+                cur[i+2] = (uint8_t)((cur[i+2] * 205 + prev[i+2] * 50) >> 8);
+            }
         }
 
         for (int y = 0; y < h; y++)
