@@ -20,9 +20,6 @@
 # include <winsock2.h>
 # include <ws2tcpip.h>
 # include <windows.h>
-# if !defined(poll)
-#  define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
-# endif
 #endif
 
 #include <vlc_common.h>
@@ -129,7 +126,7 @@ typedef struct {
     vlc_object_t *p_obj;
 } auraviz_thread_t;
 
-typedef struct { auraviz_thread_t *p_thread; } filter_sys_t;
+struct filter_sys_t { auraviz_thread_t *p_thread; };
 
 /* ── FFT + Audio Analysis ── */
 static void fft_init_tables(auraviz_thread_t *p) {
