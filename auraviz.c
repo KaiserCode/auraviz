@@ -26,6 +26,7 @@
 #include <vlc_aout.h>
 #include <vlc_vout.h>
 #include <vlc_block.h>
+#include <vlc_configuration.h>
 
 #include <math.h>
 #include <string.h>
@@ -89,6 +90,7 @@ typedef struct
     float preset_time;
     struct { float x, y, vx, vy, life, hue; } particles[MAX_PARTICLES];
     bool particles_init;
+    vlc_object_t *p_obj;  /* for config_GetInt polling */
     uint8_t *p_halfbuf;
     int half_w, half_h;
 } auraviz_thread_t;
@@ -764,6 +766,14 @@ static void *Thread(void *p_data)
         p_thread->time_acc += dt;
         p_thread->preset_time += dt;
         p_thread->frame_count++;
+
+        /* Poll live config for preset changes (Lua sets this via vlc.config.set) */
+        int live_preset = config_GetInt(p_thread->p_obj, "auraviz-preset");
+        if (live_preset != p_thread->user_preset) {
+            p_thread->user_preset = live_preset;
+            memset(p_prev, 0, p_thread->i_width * p_thread->i_height * 4);
+            p_thread->particles_init = false;
+        }
 
         int active;
         if (p_thread->user_preset > 0 && p_thread->user_preset <= NUM_PRESETS)
