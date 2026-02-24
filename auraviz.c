@@ -1,12 +1,8 @@
 /*****************************************************************************
  * auraviz.c: AuraViz - GPU-accelerated audio visualization for VLC 3.0.x
  *****************************************************************************
- * Single-plugin OpenGL visualization with VLC window embedding.
- * 33 GLSL fragment shader presets driven by real-time FFT audio analysis.
- *
- * Window strategy:
- *   1) Try to find VLC's video panel (Qt widget) and embed GL child window.
- *   2) Fallback: standalone overlapped window.
+ * Single-plugin OpenGL visualization with 33 GLSL fragment shader presets
+ * driven by real-time FFT audio analysis.
  *
  * Copyright (C) 2025 AuraViz Contributors
  * Licensed under GNU LGPL 2.1+
@@ -20,12 +16,9 @@
 # include <winsock2.h>
 # include <ws2tcpip.h>
 # include <windows.h>
-/* VLC's vlc_threads.h calls poll() which doesn't exist on Windows.
-   Provide it before VLC headers are included. */
-static inline int _auraviz_poll(struct pollfd *fds, unsigned long nfds, int timeout) {
-    return WSAPoll(fds, nfds, timeout);
-}
-# define poll(fds, nfds, timeout) _auraviz_poll((fds), (nfds), (timeout))
+# if !defined(poll)
+#  define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
+# endif
 #endif
 
 #include <vlc_common.h>
@@ -52,7 +45,7 @@ static inline int _auraviz_poll(struct pollfd *fds, unsigned long nfds, int time
 #define VOUT_HEIGHT  500
 #define NUM_BANDS    64
 #define MAX_BLOCKS   100
-#define NUM_PRESETS  34
+#define NUM_PRESETS  33
 #define FFT_N        1024
 #define RING_SIZE    4096
 
@@ -76,7 +69,7 @@ vlc_module_begin ()
     add_shortcut( "auraviz" )
 vlc_module_end ()
 
-/* ── GL Function Pointers ── */
+/* -- GL Function Pointers -- */
 static PFNGLCREATESHADERPROC        gl_CreateShader;
 static PFNGLSHADERSOURCEPROC        gl_ShaderSource;
 static PFNGLCOMPILESHADERPROC       gl_CompileShader;
@@ -111,12 +104,12 @@ static int load_gl_functions(void) {
     return 0;
 }
 
-/* ── Thread Data ── */
+/* -- Thread Data -- */
 typedef struct {
     vlc_thread_t thread;
     int i_width, i_height, i_channels, i_rate;
     vlc_mutex_t lock; vlc_cond_t wait;
-    bool b_exit;
+    block_t *pp_blocks[MAX_BLOCKS]; int i_blocks; bool b_exit;
     float ring[RING_SIZE]; int ring_pos;
     float fft_cos[FFT_N/2]; float fft_sin[FFT_N/2];
     float bands[NUM_BANDS]; float smooth_bands[NUM_BANDS];
@@ -129,13 +122,12 @@ typedef struct {
     HWND hwnd; HDC hdc; HGLRC hglrc;
     GLuint programs[NUM_PRESETS]; GLuint spectrum_tex;
     bool gl_ready;
-    bool audio_fresh;  /* set by audio thread when new analysis ready */
     vlc_object_t *p_obj;
 } auraviz_thread_t;
 
 struct filter_sys_t { auraviz_thread_t *p_thread; };
 
-/* ── FFT + Audio Analysis ── */
+/* -- FFT + Audio Analysis -- */
 static void fft_init_tables(auraviz_thread_t *p) {
     for (int i = 0; i < FFT_N/2; i++) {
         double a = -2.0 * M_PI * i / FFT_N;
@@ -206,7 +198,7 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples, int nb, int
     if(p->beat<0) p->beat=0; p->prev_energy=p->energy;
 }
 
-/* ── Shader Infrastructure ── */
+/* -- Shader Infrastructure -- */
 static const char *frag_header =
     "#version 120\n"
     "uniform float u_time;\n"
@@ -218,7 +210,17 @@ static const char *frag_header =
     "uniform float u_beat;\n"
     "uniform sampler1D u_spectrum;\n"
     "float spec(float x) { return texture1D(u_spectrum, x).r; }\n"
-    "float noise(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }\n"
+    "float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }\n"
+    "float noise(vec2 p) {\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    float a = hash(i);\n"
+    "    float b = hash(i + vec2(1.0, 0.0));\n"
+    "    float c = hash(i + vec2(0.0, 1.0));\n"
+    "    float d = hash(i + vec2(1.0, 1.0));\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "}\n"
     "vec3 hsv2rgb(vec3 c) {\n"
     "    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);\n"
     "    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);\n"
@@ -239,7 +241,7 @@ static GLuint build_program(const char *body, vlc_object_t *obj) {
     return prog;
 }
 
-/* ══ ALL 33 FRAGMENT SHADERS ══ */
+/* == ALL 33 ORIGINAL FRAGMENT SHADERS == */
 
 static const char *frag_spectrum =
     "void main() {\n"
@@ -268,14 +270,11 @@ static const char *frag_circular =
 
 static const char *frag_particles =
     "void main() {\n"
-    "    vec2 uv = gl_FragCoord.xy / u_resolution;\n"
-    "    float aspect = u_resolution.x / u_resolution.y;\n"
-    "    vec3 col = vec3(0.0);\n"
+    "    vec2 uv = gl_FragCoord.xy / u_resolution; float aspect = u_resolution.x/u_resolution.y; vec3 col = vec3(0.0);\n"
     "    for(int i=0;i<60;i++){\n"
-    "        float fi=float(i); vec2 p=vec2(noise(vec2(fi,0)),noise(vec2(0,fi)));\n"
+    "        float fi=float(i); vec2 p=vec2(hash(vec2(fi,0.0)),hash(vec2(0.0,fi)));\n"
     "        p=fract(p+u_time*vec2(0.02+fi*0.003,0.03-fi*0.002));\n"
-    "        vec2 diff=uv-p; diff.x*=aspect;\n"
-    "        float d=length(diff);\n"
+    "        vec2 diff=uv-p; diff.x*=aspect; float d=length(diff);\n"
     "        float bval=spec(mod(fi*3.0,64.0)/64.0);\n"
     "        col+=hsv2rgb(vec3(mod(fi/60.0+u_time*0.05,1.0),0.7,1.0))*0.003*(0.5+bval)/(d+0.003);\n"
     "    }\n"
@@ -283,16 +282,10 @@ static const char *frag_particles =
 
 static const char *frag_nebula =
     "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    uv.y+=u_beat*sin(u_time*6.0)*0.15+u_bass*sin(u_time*2.0)*0.1;\n"
-    "    float t=u_time*0.2, dist=length(uv)+0.001, angle=atan(uv.y,uv.x);\n"
-    "    float arms=sin(angle*3.0-log(dist+0.1)*5.0+t*3.0)*0.5+0.5;\n"
-    "    float jagged=noise(vec2(angle*8.0+t*2.0,dist*15.0))*0.3+noise(vec2(angle*16.0,dist*30.0-t*4.0))*0.15;\n"
-    "    arms=arms+jagged*(0.5+u_energy);\n"
-    "    float n=arms*(0.4+0.6/(dist*2.0+0.3))*(0.5+u_energy*1.5+u_beat*0.5);\n"
-    "    float core=exp(-dist*dist*3.0)*(1.0+u_bass*1.5);\n"
-    "    n+=core;\n"
-    "    gl_FragColor = vec4(hsv2rgb(vec3(mod(angle*0.159+n*0.3+t*0.05,1.0),0.6+u_bass*0.3,clamp(n,0.0,1.0))),1.0);\n}\n";
+    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time*0.2; vec2 p=uv*3.0;\n"
+    "    float n=noise(p+t)*0.5+noise(p*2.0+t*1.5)*0.3+noise(p*4.0+t*0.5)*0.2;\n"
+    "    n *= (0.5+u_energy*1.5+u_beat*0.3);\n"
+    "    gl_FragColor = vec4(hsv2rgb(vec3(mod(n*0.5+u_time*0.02,1.0),0.6+u_bass*0.3,clamp(n,0.0,1.0))),1.0);\n}\n";
 
 static const char *frag_plasma =
     "void main() {\n"
@@ -303,8 +296,6 @@ static const char *frag_plasma =
 static const char *frag_tunnel =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    uv+=vec2(sin(u_time*1.2+u_bass*4.0)*0.15*u_energy, cos(u_time*0.9+u_mid*3.0)*0.12*u_energy);\n"
-    "    uv+=vec2(u_beat*sin(u_time*8.0)*0.08, u_beat*cos(u_time*6.0)*0.06);\n"
     "    float dist=length(uv)+0.001, angle=atan(uv.y,uv.x), tunnel=1.0/dist, t=u_time*0.5;\n"
     "    float pattern=(sin(tunnel*3.0-t*4.0+u_bass*3.0)*0.5+0.5)*(sin(angle*4.0+tunnel*2.0+t)*0.3+0.7);\n"
     "    float val=pattern*(0.3+0.7/(dist*4.0+0.3))*(1.0+u_energy+u_beat*0.3);\n"
@@ -321,45 +312,30 @@ static const char *frag_kaleidoscope =
 
 static const char *frag_lava =
     "void main() {\n"
-    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time*0.2;\n"
-    "    vec3 col=vec3(0.0); float aspect=u_resolution.x/u_resolution.y;\n"
-    "    for(int i=0;i<20;i++){float fi=float(i);\n"
-    "        vec2 center=vec2(0.5+sin(fi*1.3+t*0.4+sin(t*0.2+fi*0.7))*0.4, 0.5+cos(fi*0.9+t*0.3+cos(t*0.15+fi))*0.4);\n"
-    "        float dx=(uv.x-center.x)*aspect, dy=uv.y-center.y;\n"
-    "        float d=sqrt(dx*dx+dy*dy);\n"
-    "        float sz=0.08+0.06*sin(fi*2.1+t*0.5)+spec(mod(fi*3.0,64.0)/64.0)*0.06+u_bass*0.04;\n"
-    "        float blob=smoothstep(sz,sz*0.2,d);\n"
-    "        float hue=mod(fi*0.05+t*0.03+d*0.5,1.0);\n"
-    "        col+=hsv2rgb(vec3(hue,0.5,1.0))*blob*(0.8+u_beat*0.4+spec(fi/20.0)*0.5);\n"
-    "    }\n"
-    "    col+=vec3(0.03,0.01,0.05);\n"
-    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time*0.15;\n"
+    "    float n=(noise(uv*4.0+vec2(t,-t*0.7))+noise(uv*8.0+vec2(-t*0.5,t*0.3))*0.5+noise(uv*16.0+vec2(t*0.3))*0.25)*(0.6+u_bass*0.8+u_beat*0.3);\n"
+    "    vec3 col; if(n<0.3) col=vec3(n*3.3*0.5,0,0);\n"
+    "    else if(n<0.6){float f=(n-0.3)*3.3; col=vec3(0.5+f*0.5,f*0.3,0);}\n"
+    "    else{float f=(n-0.6)*2.5; col=vec3(1,0.3+f*0.7,f*0.3);}\n"
+    "    gl_FragColor = vec4(col, 1.0);\n}\n";
 
 static const char *frag_starburst =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
     "    float dist=length(uv)+0.001, angle=atan(uv.y,uv.x), t=u_time*0.5, rays=0.0;\n"
-    "    for(int i=0;i<16;i++){float a=float(i)*0.3927+t*0.3;\n"
-    "        float diff=angle-a; diff=diff-6.28318*floor(diff/6.28318+0.5);\n"
-    "        rays+=exp(-diff*diff*60.0)*(0.5+spec(float(i)/16.0));}\n"
-    "    float glow=0.05/(dist+0.05)*(0.5+u_energy); rays+=glow;\n"
-    "    float val=rays/(dist*2.0+0.2)*(0.6+u_energy+u_beat*0.5)+exp(-dist*dist*5.0)*u_bass*1.5;\n"
-    "    gl_FragColor = vec4(hsv2rgb(vec3(mod(angle/6.28318+0.5+t*0.1,1.0),0.7,clamp(val,0.0,1.0))),1.0);\n}\n";
+    "    for(int i=0;i<12;i++){float a=float(i)*0.5236+t*0.3; float diff=mod(angle-a+3.14159,6.28318)-3.14159;\n"
+    "        rays+=exp(-diff*diff*80.0)*(0.5+spec(float(i)/12.0));}\n"
+    "    float val=rays/(dist*3.0+0.3)*(0.5+u_energy+u_beat*0.5)+exp(-dist*dist*8.0)*u_bass;\n"
+    "    gl_FragColor = vec4(hsv2rgb(vec3(mod(angle*0.159+t*0.1,1.0),0.7,clamp(val,0.0,1.0))),1.0);\n}\n";
 
 static const char *frag_storm =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float t=u_time, dist=length(uv); vec3 col=vec3(0.0);\n"
+    "    float t=u_time; vec3 col=vec3(0.0);\n"
     "    for(int i=0;i<6;i++){float fi=float(i), angle=fi*1.0472+t*0.4;\n"
     "        vec2 dir=vec2(cos(angle),sin(angle));\n"
     "        float d=abs(dot(uv,dir.yx*vec2(1,-1)))+noise(vec2(dot(uv,dir)*10.0+t*3.0,fi*7.0))*0.08*u_energy;\n"
     "        col+=hsv2rgb(vec3(mod(0.6+fi*0.1+t*0.05,1.0),0.5,1.0))*0.005/(d+0.005)*(0.3+spec(fi/6.0)*0.7+u_beat*0.3);}\n"
-    "    for(int w=0;w<5;w++){float fw=float(w);\n"
-    "        float radius=mod(fw*0.3+t*0.8+u_beat*0.5,2.0);\n"
-    "        float ring=abs(dist-radius); float age=radius/2.0;\n"
-    "        float web=0.003/(ring+0.003)*(1.0-age)*(0.3+u_energy*0.7);\n"
-    "        float a=atan(uv.y,uv.x); float spokes=abs(sin(a*8.0+fw*1.5))*0.5+0.5;\n"
-    "        col+=vec3(0.5,0.6,1.0)*web*spokes*(0.5+u_beat*0.5);}\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_ripple =
@@ -390,7 +366,7 @@ static const char *frag_galaxy =
 static const char *frag_glitch =
     "void main() {\n"
     "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time;\n"
-    "    float glitch=noise(vec2(floor(uv.y*40.0),floor(t*7.0)));\n"
+    "    float glitch=hash(vec2(floor(uv.y*40.0),floor(t*7.0)));\n"
     "    float offset=(glitch>0.7)?(glitch-0.7)*0.3*(u_bass+u_beat):0.0;\n"
     "    float x=uv.x+offset;\n"
     "    float gx=mod(abs(x*20.0+t*2.0),1.0), gy=mod(abs(uv.y*20.0+t*0.5),1.0);\n"
@@ -449,16 +425,13 @@ static const char *frag_vortex =
 
 static const char *frag_julia =
     "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.2*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    vec2 c=vec2(-0.74+sin(u_time*0.25)*0.12+u_bass*0.2, 0.18+cos(u_time*0.2)*0.12+u_treble*0.15);\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*3.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 c=vec2(-0.7+sin(u_time*0.3)*0.2+u_bass*0.15, 0.27+cos(u_time*0.25)*0.15+u_treble*0.1);\n"
     "    vec2 z=uv; float iter=0.0;\n"
-    "    for(int i=0;i<80;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c; if(dot(z,z)>4.0) break; iter+=1.0;}\n"
-    "    float f=iter/80.0;\n"
-    "    float edge=1.0-smoothstep(0.0,0.05,abs(f-0.5));\n"
-    "    float hue=mod(f*4.0+u_time*0.15+length(z)*0.1,1.0);\n"
-    "    float val=f<1.0?pow(f,0.4)*(1.0+u_energy*0.8+u_beat*0.5)+edge*0.4:0.05;\n"
-    "    float sat=0.7+0.3*sin(f*12.0+u_time);\n"
-    "    gl_FragColor = vec4(hsv2rgb(vec3(hue,sat,clamp(val,0.0,1.0))),1.0);\n}\n";
+    "    for(int i=0;i<64;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c; if(dot(z,z)>4.0) break; iter+=1.0;}\n"
+    "    float f=iter/64.0, hue=mod(f*3.0+u_time*0.1,1.0);\n"
+    "    float val=f<1.0?sqrt(f)*(0.6+u_energy*0.4+u_beat*0.2):0.0;\n"
+    "    gl_FragColor = vec4(hsv2rgb(vec3(hue,0.85,clamp(val,0.0,1.0))),1.0);\n}\n";
 
 static const char *frag_smoke =
     "float fbm(vec2 p){float v=0.0,a=0.5; for(int i=0;i<5;i++){v+=a*noise(p);p=p*2.1+vec2(1.7,9.2);a*=0.5;} return v;}\n"
@@ -488,19 +461,13 @@ static const char *frag_polyhedra =
 static const char *frag_infernotunnel =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    uv+=vec2(sin(u_time*1.5+u_bass*3.0)*0.12*u_energy, cos(u_time*1.1+u_mid*2.5)*0.1*u_energy);\n"
-    "    uv+=vec2(u_beat*sin(u_time*7.0)*0.07, u_beat*cos(u_time*5.5)*0.05);\n"
     "    float dist=length(uv)+0.001,angle=atan(uv.y,uv.x),t=u_time*0.5,tunnel=1.0/dist;\n"
-    "    float n1=noise(vec2(angle*2.5+t*1.3,tunnel*1.5-t*2.0));\n"
-    "    float n2=noise(vec2(angle*5.0+t*0.7,tunnel*3.0-t*2.5))*0.5;\n"
-    "    float n3=noise(vec2(angle*8.0,tunnel*5.0-t*3.5))*0.25;\n"
-    "    float flame=clamp((n1+n2+n3)*(1.0+u_bass*1.2+u_beat*0.6)/(dist*2.5+0.2),0.0,1.0);\n"
-    "    vec3 col; if(flame<0.15) col=vec3(flame*5.0*0.3,0,0);\n"
-    "    else if(flame<0.3){float f=(flame-0.15)*6.67;col=vec3(0.3+f*0.4,f*0.1,0);}\n"
-    "    else if(flame<0.5){float f=(flame-0.3)*5.0;col=vec3(0.7+f*0.3,0.1+f*0.3,0);}\n"
-    "    else if(flame<0.7){float f=(flame-0.5)*5.0;col=vec3(1.0,0.4+f*0.3,f*0.05);}\n"
-    "    else if(flame<0.85){float f=(flame-0.7)*6.67;col=vec3(1.0,0.7+f*0.2,0.05+f*0.1);}\n"
-    "    else{float f=(flame-0.85)*6.67;col=vec3(1.0,0.9+f*0.1,0.15+f*0.35);}\n"
+    "    float pattern=sin(tunnel*2.0-t*3.0+angle*3.0)*0.5+0.5;\n"
+    "    float n1=noise(vec2(angle*3.0+t,tunnel*2.0-t*2.0)),n2=noise(vec2(angle*6.0,tunnel*4.0-t*3.0))*0.5;\n"
+    "    float flame=clamp((n1+n2)*pattern*(1.0+u_bass*1.5+u_beat*0.8)/(dist*3.0+0.3),0.0,1.0);\n"
+    "    vec3 col; if(flame<0.33) col=vec3(flame*3.0*0.7,0,flame*3.0*0.15);\n"
+    "    else if(flame<0.66){float f=(flame-0.33)*3.0;col=vec3(0.7+f*0.3,f*0.5,0.15-f*0.1);}\n"
+    "    else{float f=(flame-0.66)*3.0;col=vec3(1,0.5+f*0.5,0.05+f*0.95);}\n"
     "    gl_FragColor = vec4(col, 1.0);\n}\n";
 
 static const char *frag_galaxyripple =
@@ -542,18 +509,16 @@ static const char *frag_plasmaaurora =
 
 static const char *frag_fractalfire =
     "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*1.8*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    vec2 c=vec2(-0.76+sin(u_time*0.18)*0.08+u_bass*0.1, 0.14+cos(u_time*0.13)*0.08+u_treble*0.06);\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.5*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 c=vec2(-0.75+sin(u_time*0.2)*0.1,0.15+cos(u_time*0.15)*0.1+u_bass*0.08);\n"
     "    vec2 z=uv; float iter=0.0;\n"
-    "    for(int i=0;i<64;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c;if(dot(z,z)>4.0)break;iter+=1.0;}\n"
-    "    float f=iter/64.0,flame=clamp(pow(f,0.5)*(1.5+u_energy*1.0+u_beat*0.8),0.0,1.0);\n"
-    "    vec3 col; if(flame<0.15) col=vec3(flame*6.0*0.4,0,0);\n"
-    "    else if(flame<0.3){float g=(flame-0.15)*6.67;col=vec3(0.4+g*0.4,g*0.15,0);}\n"
-    "    else if(flame<0.5){float g=(flame-0.3)*5.0;col=vec3(0.8+g*0.2,0.15+g*0.35,0);}\n"
-    "    else if(flame<0.7){float g=(flame-0.5)*5.0;col=vec3(1.0,0.5+g*0.3,g*0.08);}\n"
-    "    else if(flame<0.85){float g=(flame-0.7)*6.67;col=vec3(1.0,0.8+g*0.15,0.08+g*0.15);}\n"
-    "    else{float g=(flame-0.85)*6.67;col=vec3(1.0,0.95+g*0.05,0.23+g*0.4);}\n"
-    "    if(f>=1.0) col=vec3(0.15,0.02,0.0);\n"
+    "    for(int i=0;i<48;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c;if(dot(z,z)>4.0)break;iter+=1.0;}\n"
+    "    float f=iter/48.0,flame=clamp(f*(1.0+u_energy+u_beat*0.5),0.0,1.0);\n"
+    "    vec3 col; if(flame<0.25) col=vec3(flame*4.0*0.7,0,0);\n"
+    "    else if(flame<0.5){float g=(flame-0.25)*4.0;col=vec3(0.7+g*0.3,g*0.5,0);}\n"
+    "    else if(flame<0.75){float g=(flame-0.5)*4.0;col=vec3(1,0.5+g*0.5,g*0.2);}\n"
+    "    else{float g=(flame-0.75)*4.0;col=vec3(1,1,0.2+g*0.8);}\n"
+    "    if(f>=1.0) col=vec3(0.01,0,0.02);\n"
     "    gl_FragColor = vec4(col, 1.0);\n}\n";
 
 static const char *frag_fireballs =
@@ -630,38 +595,6 @@ static const char *frag_constellation =
     "    col+=vec3(0.02,0.015,0.04)*noise(uv*5.0+t*0.1);\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
-static const char *frag_lime =
-    "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float dist=length(uv), angle=atan(uv.y,uv.x);\n"
-    "    float segments=10.0;\n"
-    "    float seg_angle=mod(angle+3.14159,6.28318/segments);\n"
-    "    float seg_mid=3.14159/segments;\n"
-    "    float membrane=abs(seg_angle-seg_mid);\n"
-    "    float membrane_line=0.003/(membrane+0.003);\n"
-    "    float rind=smoothstep(0.85,0.9,dist)-smoothstep(0.9,0.95,dist);\n"
-    "    float flesh=smoothstep(0.1,0.15,dist)*(1.0-smoothstep(0.85,0.9,dist));\n"
-    "    float t=u_time;\n"
-    "    float seed_r=0.3+0.15*sin(angle*segments*0.5+t*0.3);\n"
-    "    float seed_d=abs(dist-seed_r);\n"
-    "    float seeds=0.0;\n"
-    "    for(int i=0;i<20;i++){float fi=float(i);\n"
-    "        float sa=fi*0.314159+sin(fi*1.3+t*0.4)*0.1;\n"
-    "        float sr=0.25+0.12*sin(fi*0.7+t*0.2)+spec(fi/20.0)*0.08;\n"
-    "        vec2 sp=vec2(cos(sa)*sr,sin(sa)*sr);\n"
-    "        float sd=length(uv-sp);\n"
-    "        seeds+=0.004/(sd+0.004)*(0.5+spec(fi/20.0)+u_beat*0.3);}\n"
-    "    float pulse=0.7+u_energy*0.3+u_beat*0.2;\n"
-    "    vec3 col=vec3(0);\n"
-    "    col+=vec3(0.3,0.9,0.1)*flesh*pulse*0.6;\n"
-    "    col+=vec3(0.1,0.6,0.0)*membrane_line*flesh*0.5;\n"
-    "    col+=vec3(0.5,1.0,0.2)*rind*1.2;\n"
-    "    col+=vec3(0.9,1.0,0.7)*seeds;\n"
-    "    col+=vec3(0.0,0.15,0.0)*smoothstep(0.95,1.0,dist);\n"
-    "    float hshift=sin(t*0.3)*0.05;\n"
-    "    col.r+=hshift; col.b-=hshift;\n"
-    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
-
 static const char *get_frag_body(int preset) {
     switch(preset) {
         case 0:return frag_spectrum;case 1:return frag_wave;case 2:return frag_circular;
@@ -674,12 +607,12 @@ static const char *get_frag_body(int preset) {
         case 21:return frag_smoke;case 22:return frag_polyhedra;case 23:return frag_infernotunnel;
         case 24:return frag_galaxyripple;case 25:return frag_stormvortex;case 26:return frag_plasmaaurora;
         case 27:return frag_fractalfire;case 28:return frag_fireballs;case 29:return frag_shockwave;
-        case 30:return frag_dna;case 31:return frag_lightningweb;case 32:return frag_constellation;case 33:return frag_lime;
+        case 30:return frag_dna;case 31:return frag_lightningweb;case 32:return frag_constellation;
         default:return frag_spectrum;
     }
 }
 
-/* ══ Win32 Window (standalone GL window) ══ */
+/* == Standalone Win32 GL Window == */
 static const wchar_t WNDCLASS_NAME[] = L"AuraVizClass";
 static volatile int g_resize_w = 0, g_resize_h = 0;
 static volatile bool g_resized = false;
@@ -694,100 +627,57 @@ static void toggle_fullscreen(HWND hwnd) {
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
             SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right - mi.rcMonitor.left,
-                         mi.rcMonitor.bottom - mi.rcMonitor.top,
-                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                         mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
         }
         g_fullscreen = true;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
         g_fullscreen = false;
     }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_SIZE: {
-            int w = LOWORD(lp), h = HIWORD(lp);
-            if (w > 0 && h > 0) { g_resize_w = w; g_resize_h = h; g_resized = true; }
-            return 0;
-        }
-        case WM_LBUTTONDBLCLK:
-            toggle_fullscreen(hwnd);
-            return 0;
-        case WM_CLOSE:
-            ShowWindow(hwnd, SW_HIDE);
-            return 0;
+        case WM_SIZE: { int w=LOWORD(lp),h=HIWORD(lp); if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;} return 0; }
+        case WM_LBUTTONDBLCLK: toggle_fullscreen(hwnd); return 0;
+        case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
         case WM_KEYDOWN:
-            if (wp == VK_ESCAPE) {
-                if (g_fullscreen) toggle_fullscreen(hwnd);
-                else ShowWindow(hwnd, SW_HIDE);
-                return 0;
-            }
-            if (wp == VK_F11 || wp == 'F') { toggle_fullscreen(hwnd); return 0; }
-            break;
+            if(wp==VK_ESCAPE){if(g_fullscreen)toggle_fullscreen(hwnd);else ShowWindow(hwnd,SW_HIDE);return 0;}
+            if(wp==VK_F11||wp=='F'){toggle_fullscreen(hwnd);return 0;} break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static HWND create_gl_window(int w, int h) {
+static int init_gl_context(auraviz_thread_t *p) {
     WNDCLASSEXW wc = {0};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_OWNDC | CS_DBLCLKS;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = GetModuleHandle(NULL);
+    wc.cbSize = sizeof(wc); wc.style = CS_OWNDC|CS_DBLCLKS;
+    wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WNDCLASS_NAME;
     RegisterClassExW(&wc);
-
-    DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-    RECT r = {0, 0, w, h};
-    AdjustWindowRect(&r, style, FALSE);
-
-    return CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz",
-                           style, CW_USEDEFAULT, CW_USEDEFAULT,
-                           r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, GetModuleHandle(NULL), NULL);
-}
-
-static int init_gl_context(auraviz_thread_t *p) {
-    p->hwnd = create_gl_window(p->i_width, p->i_height);
-    if (!p->hwnd) {
-        msg_Err(p->p_obj, "AuraViz: window creation failed");
-        return -1;
-    }
+    DWORD style = WS_OVERLAPPEDWINDOW|WS_VISIBLE;
+    RECT r = {0, 0, p->i_width, p->i_height}; AdjustWindowRect(&r, style, FALSE);
+    p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz", style,
+                              CW_USEDEFAULT, CW_USEDEFAULT, r.right-r.left, r.bottom-r.top,
+                              NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (!p->hwnd) return -1;
     p->hdc = GetDC(p->hwnd);
-
     PIXELFORMATDESCRIPTOR pfd = {0};
-    pfd.nSize = sizeof(pfd);
-    pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.iPixelType = PFD_TYPE_RGBA;
-    pfd.cColorBits = 32;
-    pfd.iLayerType = PFD_MAIN_PLANE;
-
-    int fmt = ChoosePixelFormat(p->hdc, &pfd);
-    if (!fmt) { msg_Err(p->p_obj, "AuraViz: ChoosePixelFormat failed"); return -1; }
+    pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32; pfd.iLayerType = PFD_MAIN_PLANE;
+    int fmt = ChoosePixelFormat(p->hdc, &pfd); if (!fmt) return -1;
     SetPixelFormat(p->hdc, fmt, &pfd);
-
-    p->hglrc = wglCreateContext(p->hdc);
-    if (!p->hglrc) { msg_Err(p->p_obj, "AuraViz: wglCreateContext failed (err=%lu)", GetLastError()); return -1; }
+    p->hglrc = wglCreateContext(p->hdc); if (!p->hglrc) return -1;
     wglMakeCurrent(p->hdc, p->hglrc);
-
-    /* Log GL version for diagnostics */
     const char *gl_ver = (const char *)glGetString(GL_VERSION);
     const char *gl_ren = (const char *)glGetString(GL_RENDERER);
     msg_Info(p->p_obj, "AuraViz GL: %s on %s", gl_ver ? gl_ver : "?", gl_ren ? gl_ren : "?");
-
-    if (load_gl_functions() < 0) {
-        msg_Err(p->p_obj, "AuraViz: failed to load GLSL functions — need OpenGL 2.0+");
-        return -1;
-    }
+    if (load_gl_functions() < 0) { msg_Err(p->p_obj, "AuraViz: need OpenGL 2.0+"); return -1; }
     return 0;
 }
 
@@ -796,7 +686,7 @@ static void cleanup_gl(auraviz_thread_t *p) {
     if (p->hwnd) { ReleaseDC(p->hwnd, p->hdc); DestroyWindow(p->hwnd); }
 }
 
-/* ══ Render Thread ══ */
+/* == Render Thread == */
 static void *Thread(void *p_data) {
     auraviz_thread_t *p = (auraviz_thread_t *)p_data;
     int canc = vlc_savecancel();
@@ -817,131 +707,79 @@ static void *Thread(void *p_data) {
     int cur_w = p->i_width, cur_h = p->i_height;
     p->gl_ready = true;
 
-    /* Config polling interval — don't hammer config_GetInt every frame */
-    int config_counter = 0;
-
     for (;;) {
-        MSG msg;
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
+        MSG msg; while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+        if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); g_resized=false; }
 
-        /* Handle window resize */
-        if (g_resized) {
-            cur_w = g_resize_w; cur_h = g_resize_h;
-            glViewport(0, 0, cur_w, cur_h);
-            g_resized = false;
-        }
-
-        /* Wait for audio data — render thread just reads shared analysis results */
+        block_t *p_block;
         vlc_mutex_lock(&p->lock);
-        if (!p->audio_fresh && !p->b_exit)
-            vlc_cond_timedwait(&p->wait, &p->lock, mdate() + 16000);
+        if (p->i_blocks == 0 && !p->b_exit) vlc_cond_timedwait(&p->wait, &p->lock, mdate() + 16000);
         if (p->b_exit) { vlc_mutex_unlock(&p->lock); break; }
-
-        /* Snapshot audio state under lock */
-        float snap_time = p->time_acc;
-        float snap_bass = p->bass, snap_mid = p->mid, snap_treble = p->treble;
-        float snap_energy = p->energy, snap_beat = p->beat;
-        float snap_bands[NUM_BANDS];
-        memcpy(snap_bands, p->smooth_bands, sizeof(snap_bands));
-        float snap_preset_time = p->preset_time;
-        int snap_preset = p->preset;
-        p->audio_fresh = false;
+        if (p->i_blocks == 0) { vlc_mutex_unlock(&p->lock); continue; }
+        p_block = p->pp_blocks[0]; p->i_blocks--;
+        memmove(p->pp_blocks, &p->pp_blocks[1], p->i_blocks * sizeof(block_t *));
         vlc_mutex_unlock(&p->lock);
 
-        /* Poll config less frequently (every ~15 frames) */
-        if (++config_counter >= 15) {
-            config_counter = 0;
-            int lp_val = config_GetInt(p->p_obj, "auraviz-preset");
-            if (lp_val != p->user_preset) p->user_preset = lp_val;
-            p->gain = config_GetInt(p->p_obj, "auraviz-gain");
-            p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
-        }
+        float dt = (float)p_block->i_nb_samples / (float)p->i_rate;
+        if (dt<=0) dt=0.02f; if (dt>0.2f) dt=0.2f; p->dt=dt;
+        analyze_audio(p, (const float*)p_block->p_buffer, p_block->i_nb_samples, p->i_channels);
+        p->time_acc+=dt; p->preset_time+=dt; p->frame_count++;
 
-        /* Determine active preset */
+        int lp_val = config_GetInt(p->p_obj, "auraviz-preset");
+        if (lp_val != p->user_preset) p->user_preset = lp_val;
+        p->gain = config_GetInt(p->p_obj, "auraviz-gain");
+        p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
+
         int active;
-        if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS)
-            active = p->user_preset - 1;
-        else {
-            if ((snap_beat > 0.4f && snap_preset_time > 15.0f) || snap_preset_time > 30.0f) {
-                vlc_mutex_lock(&p->lock);
-                p->preset = (p->preset + 1) % NUM_PRESETS;
-                p->preset_time = 0;
-                vlc_mutex_unlock(&p->lock);
-            }
-            active = p->preset;
-        }
+        if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS) active = p->user_preset - 1;
+        else { if ((p->beat>0.4f && p->preset_time>15.0f) || p->preset_time>30.0f) { p->preset=(p->preset+1)%NUM_PRESETS; p->preset_time=0; } active=p->preset; }
         active %= NUM_PRESETS;
-        if (!p->programs[active]) {
-            for (int i = 0; i < NUM_PRESETS; i++)
-                if (p->programs[i]) { active = i; break; }
-        }
+        if (!p->programs[active]) { for(int i=0;i<NUM_PRESETS;i++) if(p->programs[i]){active=i;break;} }
 
-        /* Upload spectrum + render */
         glBindTexture(GL_TEXTURE_1D, p->spectrum_tex);
-        glTexSubImage1D(GL_TEXTURE_1D, 0, 0, NUM_BANDS, GL_RED, GL_FLOAT, snap_bands);
-
-        GLuint prog = p->programs[active];
-        gl_UseProgram(prog);
-        gl_Uniform1f(gl_GetUniformLocation(prog, "u_time"), snap_time);
-        gl_Uniform2f(gl_GetUniformLocation(prog, "u_resolution"), (float)cur_w, (float)cur_h);
-        gl_Uniform1f(gl_GetUniformLocation(prog, "u_bass"), snap_bass);
-        gl_Uniform1f(gl_GetUniformLocation(prog, "u_mid"), snap_mid);
-        gl_Uniform1f(gl_GetUniformLocation(prog, "u_treble"), snap_treble);
-        gl_Uniform1f(gl_GetUniformLocation(prog, "u_energy"), snap_energy);
-        gl_Uniform1f(gl_GetUniformLocation(prog, "u_beat"), snap_beat);
+        glTexSubImage1D(GL_TEXTURE_1D, 0, 0, NUM_BANDS, GL_RED, GL_FLOAT, p->smooth_bands);
+        GLuint prog = p->programs[active]; gl_UseProgram(prog);
+        gl_Uniform1f(gl_GetUniformLocation(prog,"u_time"), p->time_acc);
+        gl_Uniform2f(gl_GetUniformLocation(prog,"u_resolution"), (float)cur_w, (float)cur_h);
+        gl_Uniform1f(gl_GetUniformLocation(prog,"u_bass"), p->bass);
+        gl_Uniform1f(gl_GetUniformLocation(prog,"u_mid"), p->mid);
+        gl_Uniform1f(gl_GetUniformLocation(prog,"u_treble"), p->treble);
+        gl_Uniform1f(gl_GetUniformLocation(prog,"u_energy"), p->energy);
+        gl_Uniform1f(gl_GetUniformLocation(prog,"u_beat"), p->beat);
         gl_ActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_1D, p->spectrum_tex);
-        gl_Uniform1i(gl_GetUniformLocation(prog, "u_spectrum"), 0);
-
+        gl_Uniform1i(gl_GetUniformLocation(prog,"u_spectrum"), 0);
         glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex2f(-1, -1);
-        glTexCoord2f(1, 0); glVertex2f( 1, -1);
-        glTexCoord2f(1, 1); glVertex2f( 1,  1);
-        glTexCoord2f(0, 1); glVertex2f(-1,  1);
+        glTexCoord2f(0,0);glVertex2f(-1,-1); glTexCoord2f(1,0);glVertex2f(1,-1);
+        glTexCoord2f(1,1);glVertex2f(1,1); glTexCoord2f(0,1);glVertex2f(-1,1);
         glEnd();
-
-        gl_UseProgram(0);
-        SwapBuffers(p->hdc);
+        gl_UseProgram(0); SwapBuffers(p->hdc); block_Release(p_block);
     }
-
-    for (int i = 0; i < NUM_PRESETS; i++)
-        if (p->programs[i]) gl_DeleteProgram(p->programs[i]);
-    if (p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
+    for(int i=0;i<NUM_PRESETS;i++) if(p->programs[i]) gl_DeleteProgram(p->programs[i]);
+    if(p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
     cleanup_gl(p); vlc_restorecancel(canc); return NULL;
 }
 
-/* ══ VLC Filter Callbacks ══ */
+/* == VLC Filter Callbacks == */
 static block_t *DoWork(filter_t *p_filter, block_t *p_in_buf) {
-    filter_sys_t *p_sys = p_filter->p_sys;
+    struct filter_sys_t *p_sys = p_filter->p_sys;
     auraviz_thread_t *p_thread = p_sys->p_thread;
-
-    /* Analyze audio directly on the audio thread — no copying, no queue.
-       This is fast (just FFT + band extraction) and avoids stalling audio. */
-    int nb = p_in_buf->i_nb_samples;
-    const float *samples = (const float *)p_in_buf->p_buffer;
-    float dt = (float)nb / (float)p_thread->i_rate;
-    if (dt <= 0) dt = 0.02f;
-    if (dt > 0.2f) dt = 0.2f;
-
-    vlc_mutex_lock(&p_thread->lock);
-    p_thread->dt = dt;
-    analyze_audio(p_thread, samples, nb, p_thread->i_channels);
-    p_thread->time_acc += dt;
-    p_thread->preset_time += dt;
-    p_thread->frame_count++;
-    p_thread->audio_fresh = true;
-    vlc_cond_signal(&p_thread->wait);
-    vlc_mutex_unlock(&p_thread->lock);
-
+    block_t *p_block = block_Alloc(p_in_buf->i_buffer);
+    if (p_block) {
+        memcpy(p_block->p_buffer, p_in_buf->p_buffer, p_in_buf->i_buffer);
+        p_block->i_nb_samples = p_in_buf->i_nb_samples; p_block->i_pts = p_in_buf->i_pts;
+        vlc_mutex_lock(&p_thread->lock);
+        if (p_thread->i_blocks < MAX_BLOCKS) p_thread->pp_blocks[p_thread->i_blocks++] = p_block;
+        else block_Release(p_block);
+        vlc_cond_signal(&p_thread->wait);
+        vlc_mutex_unlock(&p_thread->lock);
+    }
     return p_in_buf;
 }
 
 static int Open(vlc_object_t *p_this) {
     filter_t *p_filter = (filter_t *)p_this;
-    filter_sys_t *p_sys = p_filter->p_sys = malloc(sizeof(filter_sys_t));
+    struct filter_sys_t *p_sys = p_filter->p_sys = malloc(sizeof(struct filter_sys_t));
     if (!p_sys) return VLC_ENOMEM;
     auraviz_thread_t *p_thread = p_sys->p_thread = calloc(1, sizeof(*p_thread));
     if (!p_thread) { free(p_sys); return VLC_ENOMEM; }
@@ -973,13 +811,13 @@ static int Open(vlc_object_t *p_this) {
 
 static void Close(vlc_object_t *p_this) {
     filter_t *p_filter = (filter_t *)p_this;
-    filter_sys_t *p_sys = p_filter->p_sys;
+    struct filter_sys_t *p_sys = p_filter->p_sys;
     vlc_mutex_lock(&p_sys->p_thread->lock);
     p_sys->p_thread->b_exit = true;
     vlc_cond_signal(&p_sys->p_thread->wait);
     vlc_mutex_unlock(&p_sys->p_thread->lock);
     vlc_join(p_sys->p_thread->thread, NULL);
-    /* No block queue to clean — audio analyzed directly in DoWork */
+    for (int i = 0; i < p_sys->p_thread->i_blocks; i++) block_Release(p_sys->p_thread->pp_blocks[i]);
     vlc_mutex_destroy(&p_sys->p_thread->lock); vlc_cond_destroy(&p_sys->p_thread->wait);
     free(p_sys->p_thread); free(p_sys);
 }
