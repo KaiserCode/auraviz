@@ -45,7 +45,7 @@
 #define VOUT_HEIGHT  500
 #define NUM_BANDS    64
 #define MAX_BLOCKS   100
-#define NUM_PRESETS  35
+#define NUM_PRESETS  37
 #define FFT_N        1024
 #define RING_SIZE    4096
 
@@ -60,7 +60,7 @@ vlc_module_begin ()
     set_capability( "visualization", 0 )
     add_integer( "auraviz-width",  VOUT_WIDTH,  "Video width", "Width of visualization window", false )
     add_integer( "auraviz-height", VOUT_HEIGHT, "Video height", "Height of visualization window", false )
-    add_integer( "auraviz-preset", 0, "Preset", "0=auto-cycle, 1-35=specific", false )
+    add_integer( "auraviz-preset", 0, "Preset", "0=auto-cycle, 1-37=specific", false )
     add_integer( "auraviz-gain", 50, "Gain", "Sensitivity 0-100", false )
         change_integer_range( 0, 100 )
     add_integer( "auraviz-smooth", 50, "Smoothing", "0-100", false )
@@ -211,15 +211,20 @@ static const char *frag_header =
     "uniform sampler1D u_spectrum;\n"
     "float spec(float x) { return texture1D(u_spectrum, x).r; }\n"
     "float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }\n"
+    "vec2 ghash(vec2 p) {\n"
+    "    float a = dot(p, vec2(127.1, 311.7));\n"
+    "    float b = dot(p, vec2(269.5, 183.3));\n"
+    "    return fract(sin(vec2(a, b)) * 43758.5453) * 2.0 - 1.0;\n"
+    "}\n"
     "float noise(vec2 p) {\n"
     "    vec2 i = floor(p);\n"
     "    vec2 f = fract(p);\n"
-    "    f = f * f * (3.0 - 2.0 * f);\n"
-    "    float a = hash(i);\n"
-    "    float b = hash(i + vec2(1.0, 0.0));\n"
-    "    float c = hash(i + vec2(0.0, 1.0));\n"
-    "    float d = hash(i + vec2(1.0, 1.0));\n"
-    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "    vec2 u = f*f*f*(f*(f*6.0-15.0)+10.0);\n"
+    "    float a = dot(ghash(i), f);\n"
+    "    float b = dot(ghash(i+vec2(1.0,0.0)), f-vec2(1.0,0.0));\n"
+    "    float c = dot(ghash(i+vec2(0.0,1.0)), f-vec2(0.0,1.0));\n"
+    "    float d = dot(ghash(i+vec2(1.0,1.0)), f-vec2(1.0,1.0));\n"
+    "    return 0.5 + 0.5*mix(mix(a,b,u.x), mix(c,d,u.x), u.y);\n"
     "}\n"
     "vec3 hsv2rgb(vec3 c) {\n"
     "    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);\n"
@@ -325,11 +330,18 @@ static const char *frag_kaleidoscope =
 
 static const char *frag_lava =
     "void main() {\n"
-    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time*0.15;\n"
-    "    float n=(noise(uv*4.0+vec2(t,-t*0.7))+noise(uv*8.0+vec2(-t*0.5,t*0.3))*0.5+noise(uv*16.0+vec2(t*0.3))*0.25)*(0.6+u_bass*0.8+u_beat*0.3);\n"
-    "    vec3 col; if(n<0.3) col=vec3(n*3.3*0.5,0,0);\n"
-    "    else if(n<0.6){float f=(n-0.3)*3.3; col=vec3(0.5+f*0.5,f*0.3,0);}\n"
-    "    else{float f=(n-0.6)*2.5; col=vec3(1,0.3+f*0.7,f*0.3);}\n"
+    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time*0.5;\n"
+    "    float n1=noise(uv*3.0+vec2(t*0.7,-t*0.5));\n"
+    "    float n2=noise(uv*5.0+vec2(-t*0.4,t*0.6)+n1*0.5);\n"
+    "    float n3=noise(uv*9.0+vec2(t*0.3,-t*0.2)+n2*0.3);\n"
+    "    float blob=n1*0.5+n2*0.35+n3*0.15;\n"
+    "    blob=blob*blob*(3.0-2.0*blob);\n"
+    "    blob=clamp(blob*(0.8+u_bass*0.5+u_beat*0.15),0.0,1.0);\n"
+    "    vec3 col;\n"
+    "    if(blob<0.35) col=vec3(blob*2.0*0.4,0.0,0.0);\n"
+    "    else if(blob<0.55){float f=(blob-0.35)*5.0; col=vec3(0.4+f*0.4,f*0.15,0.0);}\n"
+    "    else if(blob<0.75){float f=(blob-0.55)*5.0; col=vec3(0.8+f*0.15,0.15+f*0.35,f*0.05);}\n"
+    "    else{float f=(blob-0.75)*4.0; col=vec3(0.95,0.5+f*0.3,0.05+f*0.15);}\n"
     "    gl_FragColor = vec4(col, 1.0);\n}\n";
 
 static const char *frag_starburst =
@@ -696,6 +708,41 @@ static const char *frag_helixparticles =
     "        col+=hsv2rgb(vec3(hue,0.7,1.0))*glow*0.12*(0.5+u_energy);\n"
     "    }\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+static const char *frag_radialkaleidoscope =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float t=u_time;\n"
+    "    float spin_dir=sin(t*0.15)*sin(t*0.23+2.0)*sin(t*0.07+5.0);\n"
+    "    float spin=spin_dir*t*0.8;\n"
+    "    float ca=cos(spin),sa=sin(spin);\n"
+    "    uv=vec2(uv.x*ca-uv.y*sa, uv.x*sa+uv.y*ca);\n"
+    "    float angle=atan(uv.y,uv.x), dist=length(uv);\n"
+    "    angle=abs(mod(angle,6.28318/8.0)-3.14159/8.0);\n"
+    "    vec2 p=vec2(cos(angle),sin(angle))*dist;\n"
+    "    float n=noise(p*3.0+t*0.3)*0.5+noise(p*6.0-t*0.4)*0.3+noise(p*12.0+t*0.2)*0.2;\n"
+    "    n*=(1.0+u_energy*2.0+u_beat*0.5);\n"
+    "    float hue=mod(n*0.6+dist*0.3+t*0.08,1.0);\n"
+    "    gl_FragColor = vec4(hsv2rgb(vec3(hue,0.8,clamp(n,0.0,1.0))),1.0);\n}\n";
+
+static const char *frag_angularkaleidoscope =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float t=u_time*0.6, dist=length(uv), angle=atan(uv.y,uv.x);\n"
+    "    float segments=6.0;\n"
+    "    float ka=mod(angle+t*0.3,6.28318/segments);\n"
+    "    ka=abs(ka-3.14159/segments);\n"
+    "    vec2 kp=vec2(cos(ka),sin(ka))*dist;\n"
+    "    float wave=t*2.0-dist*4.0+u_beat*3.0;\n"
+    "    float tri=abs(fract(kp.x*3.0+kp.y*2.0+wave*0.3)*2.0-1.0);\n"
+    "    float sq=max(abs(fract(kp.x*2.0-t*0.5)*2.0-1.0),abs(fract(kp.y*2.0+t*0.4)*2.0-1.0));\n"
+    "    float star=1.0-smoothstep(0.2,0.25,abs(fract(ka*segments/3.14159+dist*2.0-t*0.5)*2.0-1.0));\n"
+    "    float pattern=tri*0.4+sq*0.3+star*0.3;\n"
+    "    pattern+=noise(kp*8.0+vec2(t*0.5,-t*0.3))*0.3;\n"
+    "    float ripple=sin(dist*12.0-t*4.0+u_bass*4.0)*0.5+0.5;\n"
+    "    pattern*=(0.5+ripple*0.5)*(1.0+u_energy+u_beat*0.3);\n"
+    "    float hue=mod(dist*0.3+angle*0.1+t*0.1+pattern*0.2,1.0);\n"
+    "    gl_FragColor = vec4(hsv2rgb(vec3(hue,0.85,clamp(pattern,0.0,1.0))),1.0);\n}\n";
 static const char *get_frag_body(int preset) {
     switch(preset) {
         case 0:return frag_spectrum;case 1:return frag_wave;case 2:return frag_circular;
@@ -710,6 +757,7 @@ static const char *get_frag_body(int preset) {
         case 27:return frag_fractalfire;case 28:return frag_fireballs;case 29:return frag_shockwave;
         case 30:return frag_dna;case 31:return frag_lightningweb;case 32:return frag_constellation;
         case 33:return frag_lightningweb2;case 34:return frag_helixparticles;
+        case 35:return frag_radialkaleidoscope;case 36:return frag_angularkaleidoscope;
         default:return frag_spectrum;
     }
 }
