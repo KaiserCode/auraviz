@@ -815,6 +815,8 @@ static HWND g_persistent_hwnd = NULL;
 static HDC  g_persistent_hdc = NULL;
 static HGLRC g_persistent_hglrc = NULL;
 static int g_persistent_w = 0, g_persistent_h = 0;
+static WINDOWPLACEMENT g_persistent_wp = { sizeof(WINDOWPLACEMENT) };
+static bool g_has_persistent_wp = false;
 static bool g_wndclass_registered = false;
 static const wchar_t WNDCLASS_NAME[] = L"AuraVizClass";
 static volatile int g_resize_w = 0, g_resize_h = 0;
@@ -831,19 +833,22 @@ static void toggle_fullscreen(HWND hwnd) {
         MONITORINFO mi = { sizeof(mi) };
         if (GetWindowPlacement(hwnd, &g_wp_prev) &&
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
-            /* Drop topmost FIRST — combining TOPMOST + style change + resize causes freezes */
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            /* Drop topmost and let Windows fully process it before touching anything else */
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE);
+            /* Now change style and reposition as a non-topmost window */
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+            SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
-                         SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
+                         SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
         }
         g_fullscreen = true;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        /* Restore topmost for normal windowed mode */
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
+        /* Flush the style + placement change without touching z-order */
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
+        /* Now restore topmost as a separate operation */
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         g_fullscreen = false;
     }
 }
@@ -873,8 +878,12 @@ static int init_gl_context(auraviz_thread_t *p) {
     if (g_persistent_hwnd && IsWindow(g_persistent_hwnd)) {
         p->hwnd = g_persistent_hwnd; p->hdc = g_persistent_hdc; p->hglrc = g_persistent_hglrc;
         wglMakeCurrent(p->hdc, p->hglrc);
-        /* Don't call ShowWindow — window is already visible in whatever state the user left it */
-        if (!IsWindowVisible(p->hwnd)) ShowWindow(p->hwnd, SW_SHOW);
+        /* Restore exact window position/size/state from previous song */
+        if (g_has_persistent_wp) {
+            SetWindowPlacement(p->hwnd, &g_persistent_wp);
+        } else if (!IsWindowVisible(p->hwnd)) {
+            ShowWindow(p->hwnd, SW_SHOW);
+        }
         RECT cr; GetClientRect(p->hwnd, &cr);
         p->i_width = cr.right - cr.left; p->i_height = cr.bottom - cr.top;
         g_persistent_w = p->i_width; g_persistent_h = p->i_height;
@@ -1101,6 +1110,9 @@ static void *Thread(void *p_data) {
     if(p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
     destroy_fbos(p);
     g_last_preset = p->preset;
+    /* Save full window state (position, size, maximized/normal) for next song */
+    g_persistent_wp.length = sizeof(WINDOWPLACEMENT);
+    g_has_persistent_wp = GetWindowPlacement(p->hwnd, &g_persistent_wp);
     cleanup_gl(p); vlc_restorecancel(canc); return NULL;
 }
 
