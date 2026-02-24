@@ -829,7 +829,7 @@ static void toggle_fullscreen(HWND hwnd) {
         if (GetWindowPlacement(hwnd, &g_wp_prev) &&
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+            SetWindowPos(hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
                          SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
         }
@@ -837,7 +837,7 @@ static void toggle_fullscreen(HWND hwnd) {
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
         g_fullscreen = false;
     }
 }
@@ -858,10 +858,12 @@ static int init_gl_context(auraviz_thread_t *p) {
     if (g_persistent_hwnd && IsWindow(g_persistent_hwnd)) {
         p->hwnd = g_persistent_hwnd; p->hdc = g_persistent_hdc; p->hglrc = g_persistent_hglrc;
         wglMakeCurrent(p->hdc, p->hglrc);
-        ShowWindow(p->hwnd, SW_SHOW);
+        /* Don't call ShowWindow — window is already visible in whatever state the user left it */
+        if (!IsWindowVisible(p->hwnd)) ShowWindow(p->hwnd, SW_SHOW);
         RECT cr; GetClientRect(p->hwnd, &cr);
         p->i_width = cr.right - cr.left; p->i_height = cr.bottom - cr.top;
-        msg_Info(p->p_obj, "AuraViz: reusing window (%dx%d)", p->i_width, p->i_height);
+        msg_Info(p->p_obj, "AuraViz: reusing window (%dx%d%s)", p->i_width, p->i_height,
+                 g_fullscreen ? ", fullscreen" : "");
         if (load_gl_functions() < 0) return -1;
         return 0;
     }
@@ -876,7 +878,7 @@ static int init_gl_context(auraviz_thread_t *p) {
     }
     DWORD style = WS_OVERLAPPEDWINDOW|WS_VISIBLE;
     RECT r = {0, 0, p->i_width, p->i_height}; AdjustWindowRect(&r, style, FALSE);
-    p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz", style,
+    p->hwnd = CreateWindowExW(WS_EX_TOPMOST, WNDCLASS_NAME, L"AuraViz", style,
                               CW_USEDEFAULT, CW_USEDEFAULT, r.right-r.left, r.bottom-r.top,
                               NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!p->hwnd) return -1;
