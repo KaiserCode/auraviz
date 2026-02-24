@@ -116,7 +116,7 @@ typedef struct {
     vlc_thread_t thread;
     int i_width, i_height, i_channels, i_rate;
     vlc_mutex_t lock; vlc_cond_t wait;
-    block_t *pp_blocks[MAX_BLOCKS]; int i_blocks; bool b_exit;
+    bool b_exit;
     float ring[RING_SIZE]; int ring_pos;
     float fft_cos[FFT_N/2]; float fft_sin[FFT_N/2];
     float bands[NUM_BANDS]; float smooth_bands[NUM_BANDS];
@@ -126,9 +126,10 @@ typedef struct {
     float agc_envelope, agc_peak;
     float time_acc, dt; unsigned int frame_count;
     int preset, user_preset, gain, smooth; float preset_time;
-    HWND hwnd, vlc_parent; HDC hdc; HGLRC hglrc;
+    HWND hwnd; HDC hdc; HGLRC hglrc;
     GLuint programs[NUM_PRESETS]; GLuint spectrum_tex;
-    bool gl_ready, embedded;
+    bool gl_ready;
+    bool audio_fresh;  /* set by audio thread when new analysis ready */
     vlc_object_t *p_obj;
 } auraviz_thread_t;
 
@@ -678,72 +679,7 @@ static const char *get_frag_body(int preset) {
     }
 }
 
-/* ══ VLC Window Discovery ══ */
-typedef struct { HWND found; int best_area; DWORD pid; } find_video_t;
-
-static BOOL CALLBACK find_biggest_child(HWND hwnd, LPARAM lp) {
-    find_video_t *ctx = (find_video_t *)lp;
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    RECT r;
-    GetClientRect(hwnd, &r);
-    int area = (r.right - r.left) * (r.bottom - r.top);
-    if (area > ctx->best_area) { ctx->best_area = area; ctx->found = hwnd; }
-    return TRUE;
-}
-
-/* Find VLC's main window by walking all top-level windows owned by our process */
-static BOOL CALLBACK find_vlc_main(HWND hwnd, LPARAM lp) {
-    find_video_t *ctx = (find_video_t *)lp;
-    DWORD wnd_pid;
-    GetWindowThreadProcessId(hwnd, &wnd_pid);
-    if (wnd_pid != ctx->pid) return TRUE;
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    /* Skip our own AuraViz windows */
-    wchar_t cls[64];
-    GetClassNameW(hwnd, cls, 64);
-    if (wcscmp(cls, L"AuraVizClass") == 0) return TRUE;
-    RECT r;
-    GetClientRect(hwnd, &r);
-    int area = (r.right - r.left) * (r.bottom - r.top);
-    if (area > ctx->best_area) { ctx->best_area = area; ctx->found = hwnd; }
-    return TRUE;
-}
-
-static HWND find_vlc_video_panel(vlc_object_t *obj) {
-    DWORD pid = GetCurrentProcessId();
-
-    /* Find the largest top-level window in our process (VLC main window) */
-    find_video_t ctx = { NULL, 20000, pid };
-    EnumWindows(find_vlc_main, (LPARAM)&ctx);
-    if (!ctx.found) {
-        msg_Dbg(obj, "AuraViz: no VLC main window found for PID %lu", (unsigned long)pid);
-        return NULL;
-    }
-    HWND vlc_main = ctx.found;
-    msg_Dbg(obj, "AuraViz: found VLC main window %p", (void*)vlc_main);
-
-    /* Find the largest child (likely the central video widget area) */
-    find_video_t ctx2 = { NULL, 5000, pid };
-    EnumChildWindows(vlc_main, find_biggest_child, (LPARAM)&ctx2);
-    if (!ctx2.found) {
-        msg_Dbg(obj, "AuraViz: no suitable child found, using main window");
-        return vlc_main;
-    }
-
-    /* Drill one more level — the actual video surface may be a grandchild */
-    find_video_t ctx3 = { NULL, 5000, pid };
-    EnumChildWindows(ctx2.found, find_biggest_child, (LPARAM)&ctx3);
-    if (ctx3.found) {
-        msg_Dbg(obj, "AuraViz: found video grandchild %p (%dx%d)",
-                (void*)ctx3.found, ctx3.best_area, 0);
-        return ctx3.found;
-    }
-
-    msg_Dbg(obj, "AuraViz: using child %p", (void*)ctx2.found);
-    return ctx2.found;
-}
-
-/* ══ Win32 Window ══ */
+/* ══ Win32 Window (standalone GL window) ══ */
 static const wchar_t WNDCLASS_NAME[] = L"AuraVizClass";
 static volatile int g_resize_w = 0, g_resize_h = 0;
 static volatile bool g_resized = false;
@@ -758,96 +694,87 @@ static void toggle_fullscreen(HWND hwnd) {
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
             SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
-                         SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         }
         g_fullscreen = true;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         g_fullscreen = false;
     }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_SIZE: { int w=LOWORD(lp),h=HIWORD(lp); if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;} return 0; }
-        case WM_LBUTTONDBLCLK: toggle_fullscreen(hwnd); return 0;
-        case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
+        case WM_SIZE: {
+            int w = LOWORD(lp), h = HIWORD(lp);
+            if (w > 0 && h > 0) { g_resize_w = w; g_resize_h = h; g_resized = true; }
+            return 0;
+        }
+        case WM_LBUTTONDBLCLK:
+            toggle_fullscreen(hwnd);
+            return 0;
+        case WM_CLOSE:
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
         case WM_KEYDOWN:
-            if(wp==VK_ESCAPE){if(g_fullscreen)toggle_fullscreen(hwnd);else ShowWindow(hwnd,SW_HIDE);return 0;}
-            if(wp==VK_F11||wp=='F'){toggle_fullscreen(hwnd);return 0;} break;
+            if (wp == VK_ESCAPE) {
+                if (g_fullscreen) toggle_fullscreen(hwnd);
+                else ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            if (wp == VK_F11 || wp == 'F') { toggle_fullscreen(hwnd); return 0; }
+            break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void create_window(auraviz_thread_t *p) {
+static HWND create_gl_window(int w, int h) {
     WNDCLASSEXW wc = {0};
-    wc.cbSize = sizeof(wc); wc.style = CS_OWNDC|CS_DBLCLKS;
-    wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(NULL);
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_OWNDC | CS_DBLCLKS;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.lpszClassName = WNDCLASS_NAME;
     RegisterClassExW(&wc);
 
-    /* Try to embed — retry a few times since VLC's window may still be setting up */
-    HWND vlc_panel = NULL;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        vlc_panel = find_vlc_video_panel(p->p_obj);
-        if (vlc_panel) break;
-        if (attempt < 4) Sleep(200);  /* wait 200ms between attempts */
-    }
-
-    if (vlc_panel) {
-        RECT pr;
-        GetClientRect(vlc_panel, &pr);
-        int pw = pr.right - pr.left, ph = pr.bottom - pr.top;
-        if (pw < 100) pw = p->i_width;
-        if (ph < 100) ph = p->i_height;
-        p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz",
-                                  WS_CHILD | WS_VISIBLE,
-                                  0, 0, pw, ph,
-                                  vlc_panel, NULL, GetModuleHandle(NULL), NULL);
-        if (p->hwnd) {
-            p->vlc_parent = vlc_panel;
-            p->embedded = true;
-            p->i_width = pw;
-            p->i_height = ph;
-            msg_Info(p->p_obj, "AuraViz: embedded in VLC video panel (%dx%d)", pw, ph);
-            return;
-        }
-        msg_Warn(p->p_obj, "AuraViz: CreateWindow as child failed (err=%lu), falling back",
-                 GetLastError());
-    }
-
-    /* Fallback: standalone borderless dark window, always on top initially */
-    msg_Info(p->p_obj, "AuraViz: standalone window mode");
     DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-    RECT r = {0, 0, p->i_width, p->i_height};
+    RECT r = {0, 0, w, h};
     AdjustWindowRect(&r, style, FALSE);
-    p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz GL", style,
-                              CW_USEDEFAULT, CW_USEDEFAULT,
-                              r.right - r.left, r.bottom - r.top,
-                              NULL, NULL, GetModuleHandle(NULL), NULL);
-    p->vlc_parent = NULL;
-    p->embedded = false;
+
+    return CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz",
+                           style, CW_USEDEFAULT, CW_USEDEFAULT,
+                           r.right - r.left, r.bottom - r.top,
+                           NULL, NULL, GetModuleHandle(NULL), NULL);
 }
 
 static int init_gl_context(auraviz_thread_t *p) {
-    create_window(p);
+    p->hwnd = create_gl_window(p->i_width, p->i_height);
     if (!p->hwnd) {
-        msg_Err(p->p_obj, "AuraViz: window creation failed completely");
+        msg_Err(p->p_obj, "AuraViz: window creation failed");
         return -1;
     }
     p->hdc = GetDC(p->hwnd);
+
     PIXELFORMATDESCRIPTOR pfd = {0};
-    pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER;
-    pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32; pfd.iLayerType = PFD_MAIN_PLANE;
+    pfd.nSize = sizeof(pfd);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 32;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+
     int fmt = ChoosePixelFormat(p->hdc, &pfd);
     if (!fmt) { msg_Err(p->p_obj, "AuraViz: ChoosePixelFormat failed"); return -1; }
     SetPixelFormat(p->hdc, fmt, &pfd);
+
     p->hglrc = wglCreateContext(p->hdc);
     if (!p->hglrc) { msg_Err(p->p_obj, "AuraViz: wglCreateContext failed (err=%lu)", GetLastError()); return -1; }
     wglMakeCurrent(p->hdc, p->hglrc);
@@ -857,7 +784,10 @@ static int init_gl_context(auraviz_thread_t *p) {
     const char *gl_ren = (const char *)glGetString(GL_RENDERER);
     msg_Info(p->p_obj, "AuraViz GL: %s on %s", gl_ver ? gl_ver : "?", gl_ren ? gl_ren : "?");
 
-    if (load_gl_functions() < 0) { msg_Err(p->p_obj, "AuraViz: failed to load GLSL functions — GPU may not support OpenGL 2.0+"); return -1; }
+    if (load_gl_functions() < 0) {
+        msg_Err(p->p_obj, "AuraViz: failed to load GLSL functions — need OpenGL 2.0+");
+        return -1;
+    }
     return 0;
 }
 
@@ -887,66 +817,99 @@ static void *Thread(void *p_data) {
     int cur_w = p->i_width, cur_h = p->i_height;
     p->gl_ready = true;
 
+    /* Config polling interval — don't hammer config_GetInt every frame */
+    int config_counter = 0;
+
     for (;;) {
-        MSG msg; while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-
-        /* Track parent resize if embedded */
-        if (p->embedded && p->vlc_parent) {
-            RECT pr; GetClientRect(p->vlc_parent, &pr);
-            int pw=pr.right-pr.left, ph=pr.bottom-pr.top;
-            if (pw>0 && ph>0 && (pw!=cur_w || ph!=cur_h)) {
-                MoveWindow(p->hwnd, 0, 0, pw, ph, TRUE);
-                cur_w=pw; cur_h=ph; glViewport(0, 0, cur_w, cur_h);
-            }
+        MSG msg;
+        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
-        if (g_resized && !p->embedded) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); g_resized=false; }
 
-        block_t *p_block;
+        /* Handle window resize */
+        if (g_resized) {
+            cur_w = g_resize_w; cur_h = g_resize_h;
+            glViewport(0, 0, cur_w, cur_h);
+            g_resized = false;
+        }
+
+        /* Wait for audio data — render thread just reads shared analysis results */
         vlc_mutex_lock(&p->lock);
-        if (p->i_blocks == 0 && !p->b_exit) vlc_cond_timedwait(&p->wait, &p->lock, mdate() + 16000);
+        if (!p->audio_fresh && !p->b_exit)
+            vlc_cond_timedwait(&p->wait, &p->lock, mdate() + 16000);
         if (p->b_exit) { vlc_mutex_unlock(&p->lock); break; }
-        if (p->i_blocks == 0) { vlc_mutex_unlock(&p->lock); continue; }
-        p_block = p->pp_blocks[0]; p->i_blocks--;
-        memmove(p->pp_blocks, &p->pp_blocks[1], p->i_blocks * sizeof(block_t *));
+
+        /* Snapshot audio state under lock */
+        float snap_time = p->time_acc;
+        float snap_bass = p->bass, snap_mid = p->mid, snap_treble = p->treble;
+        float snap_energy = p->energy, snap_beat = p->beat;
+        float snap_bands[NUM_BANDS];
+        memcpy(snap_bands, p->smooth_bands, sizeof(snap_bands));
+        float snap_preset_time = p->preset_time;
+        int snap_preset = p->preset;
+        p->audio_fresh = false;
         vlc_mutex_unlock(&p->lock);
 
-        float dt = (float)p_block->i_nb_samples / (float)p->i_rate;
-        if (dt<=0) dt=0.02f; if (dt>0.2f) dt=0.2f; p->dt=dt;
-        analyze_audio(p, (const float*)p_block->p_buffer, p_block->i_nb_samples, p->i_channels);
-        p->time_acc+=dt; p->preset_time+=dt; p->frame_count++;
+        /* Poll config less frequently (every ~15 frames) */
+        if (++config_counter >= 15) {
+            config_counter = 0;
+            int lp_val = config_GetInt(p->p_obj, "auraviz-preset");
+            if (lp_val != p->user_preset) p->user_preset = lp_val;
+            p->gain = config_GetInt(p->p_obj, "auraviz-gain");
+            p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
+        }
 
-        int lp_val = config_GetInt(p->p_obj, "auraviz-preset");
-        if (lp_val != p->user_preset) p->user_preset = lp_val;
-        p->gain = config_GetInt(p->p_obj, "auraviz-gain");
-        p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
-
+        /* Determine active preset */
         int active;
-        if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS) active = p->user_preset - 1;
-        else { if ((p->beat>0.4f && p->preset_time>15.0f) || p->preset_time>30.0f) { p->preset=(p->preset+1)%NUM_PRESETS; p->preset_time=0; } active=p->preset; }
+        if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS)
+            active = p->user_preset - 1;
+        else {
+            if ((snap_beat > 0.4f && snap_preset_time > 15.0f) || snap_preset_time > 30.0f) {
+                vlc_mutex_lock(&p->lock);
+                p->preset = (p->preset + 1) % NUM_PRESETS;
+                p->preset_time = 0;
+                vlc_mutex_unlock(&p->lock);
+            }
+            active = p->preset;
+        }
         active %= NUM_PRESETS;
-        if (!p->programs[active]) { for(int i=0;i<NUM_PRESETS;i++) if(p->programs[i]){active=i;break;} }
+        if (!p->programs[active]) {
+            for (int i = 0; i < NUM_PRESETS; i++)
+                if (p->programs[i]) { active = i; break; }
+        }
 
+        /* Upload spectrum + render */
         glBindTexture(GL_TEXTURE_1D, p->spectrum_tex);
-        glTexSubImage1D(GL_TEXTURE_1D, 0, 0, NUM_BANDS, GL_RED, GL_FLOAT, p->smooth_bands);
-        GLuint prog = p->programs[active]; gl_UseProgram(prog);
-        gl_Uniform1f(gl_GetUniformLocation(prog,"u_time"), p->time_acc);
-        gl_Uniform2f(gl_GetUniformLocation(prog,"u_resolution"), (float)cur_w, (float)cur_h);
-        gl_Uniform1f(gl_GetUniformLocation(prog,"u_bass"), p->bass);
-        gl_Uniform1f(gl_GetUniformLocation(prog,"u_mid"), p->mid);
-        gl_Uniform1f(gl_GetUniformLocation(prog,"u_treble"), p->treble);
-        gl_Uniform1f(gl_GetUniformLocation(prog,"u_energy"), p->energy);
-        gl_Uniform1f(gl_GetUniformLocation(prog,"u_beat"), p->beat);
+        glTexSubImage1D(GL_TEXTURE_1D, 0, 0, NUM_BANDS, GL_RED, GL_FLOAT, snap_bands);
+
+        GLuint prog = p->programs[active];
+        gl_UseProgram(prog);
+        gl_Uniform1f(gl_GetUniformLocation(prog, "u_time"), snap_time);
+        gl_Uniform2f(gl_GetUniformLocation(prog, "u_resolution"), (float)cur_w, (float)cur_h);
+        gl_Uniform1f(gl_GetUniformLocation(prog, "u_bass"), snap_bass);
+        gl_Uniform1f(gl_GetUniformLocation(prog, "u_mid"), snap_mid);
+        gl_Uniform1f(gl_GetUniformLocation(prog, "u_treble"), snap_treble);
+        gl_Uniform1f(gl_GetUniformLocation(prog, "u_energy"), snap_energy);
+        gl_Uniform1f(gl_GetUniformLocation(prog, "u_beat"), snap_beat);
         gl_ActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_1D, p->spectrum_tex);
-        gl_Uniform1i(gl_GetUniformLocation(prog,"u_spectrum"), 0);
+        gl_Uniform1i(gl_GetUniformLocation(prog, "u_spectrum"), 0);
+
         glBegin(GL_QUADS);
-        glTexCoord2f(0,0);glVertex2f(-1,-1); glTexCoord2f(1,0);glVertex2f(1,-1);
-        glTexCoord2f(1,1);glVertex2f(1,1); glTexCoord2f(0,1);glVertex2f(-1,1);
+        glTexCoord2f(0, 0); glVertex2f(-1, -1);
+        glTexCoord2f(1, 0); glVertex2f( 1, -1);
+        glTexCoord2f(1, 1); glVertex2f( 1,  1);
+        glTexCoord2f(0, 1); glVertex2f(-1,  1);
         glEnd();
-        gl_UseProgram(0); SwapBuffers(p->hdc); block_Release(p_block);
+
+        gl_UseProgram(0);
+        SwapBuffers(p->hdc);
     }
-    for(int i=0;i<NUM_PRESETS;i++) if(p->programs[i]) gl_DeleteProgram(p->programs[i]);
-    if(p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
+
+    for (int i = 0; i < NUM_PRESETS; i++)
+        if (p->programs[i]) gl_DeleteProgram(p->programs[i]);
+    if (p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
     cleanup_gl(p); vlc_restorecancel(canc); return NULL;
 }
 
@@ -954,16 +917,25 @@ static void *Thread(void *p_data) {
 static block_t *DoWork(filter_t *p_filter, block_t *p_in_buf) {
     filter_sys_t *p_sys = p_filter->p_sys;
     auraviz_thread_t *p_thread = p_sys->p_thread;
-    block_t *p_block = block_Alloc(p_in_buf->i_buffer);
-    if (p_block) {
-        memcpy(p_block->p_buffer, p_in_buf->p_buffer, p_in_buf->i_buffer);
-        p_block->i_nb_samples = p_in_buf->i_nb_samples; p_block->i_pts = p_in_buf->i_pts;
-        vlc_mutex_lock(&p_thread->lock);
-        if (p_thread->i_blocks < MAX_BLOCKS) p_thread->pp_blocks[p_thread->i_blocks++] = p_block;
-        else block_Release(p_block);
-        vlc_cond_signal(&p_thread->wait);
-        vlc_mutex_unlock(&p_thread->lock);
-    }
+
+    /* Analyze audio directly on the audio thread — no copying, no queue.
+       This is fast (just FFT + band extraction) and avoids stalling audio. */
+    int nb = p_in_buf->i_nb_samples;
+    const float *samples = (const float *)p_in_buf->p_buffer;
+    float dt = (float)nb / (float)p_thread->i_rate;
+    if (dt <= 0) dt = 0.02f;
+    if (dt > 0.2f) dt = 0.2f;
+
+    vlc_mutex_lock(&p_thread->lock);
+    p_thread->dt = dt;
+    analyze_audio(p_thread, samples, nb, p_thread->i_channels);
+    p_thread->time_acc += dt;
+    p_thread->preset_time += dt;
+    p_thread->frame_count++;
+    p_thread->audio_fresh = true;
+    vlc_cond_signal(&p_thread->wait);
+    vlc_mutex_unlock(&p_thread->lock);
+
     return p_in_buf;
 }
 
@@ -1007,7 +979,7 @@ static void Close(vlc_object_t *p_this) {
     vlc_cond_signal(&p_sys->p_thread->wait);
     vlc_mutex_unlock(&p_sys->p_thread->lock);
     vlc_join(p_sys->p_thread->thread, NULL);
-    for (int i = 0; i < p_sys->p_thread->i_blocks; i++) block_Release(p_sys->p_thread->pp_blocks[i]);
+    /* No block queue to clean — audio analyzed directly in DoWork */
     vlc_mutex_destroy(&p_sys->p_thread->lock); vlc_cond_destroy(&p_sys->p_thread->wait);
     free(p_sys->p_thread); free(p_sys);
 }
