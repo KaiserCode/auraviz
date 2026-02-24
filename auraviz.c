@@ -46,7 +46,7 @@
 #define MAX_BLOCKS   100
 #define MAX_PARTICLES 300
 #define AURAVIZ_DELAY 400000
-#define NUM_PRESETS  20
+#define NUM_PRESETS  33
 #define HALF_DIV     2
 
 /* FFT size — must be power of 2 */
@@ -1273,6 +1273,508 @@ static void render_vortex_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
     }
 }
 
+/* ======== PRESET 20: Julia Fractal (half-res) ======== */
+static void render_julia_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    float cx = -0.7f + sinf(t * 0.3f) * 0.2f + p->bass * 0.15f;
+    float cy = 0.27f + cosf(t * 0.25f) * 0.15f + p->treble * 0.1f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 3.0f;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 3.0f * aspect;
+            float zx = uvx, zy = uvy;
+            int iter = 0;
+            for (; iter < 64; iter++) {
+                float zx2 = zx * zx - zy * zy + cx;
+                zy = 2.0f * zx * zy + cy;
+                zx = zx2;
+                if (zx * zx + zy * zy > 4.0f) break;
+            }
+            float f = (float)iter / 64.0f;
+            float hue = fmodf(f * 1080 + t * 36, 360);
+            float val = f < 1.0f ? sqrtf(f) * (0.6f + p->energy * 0.4f + p->beat * 0.2f) : 0.0f;
+            val = clamp01(val);
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.85f, val, &r, &g, &b);
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 21: Smoke / Fluid (half-res) ======== */
+static float fbm2d(float x, float y) {
+    float v = 0, a = 0.5f;
+    for (int i = 0; i < 5; i++) {
+        v += a * noise2d(x, y);
+        float nx = x * 2.1f + 1.7f, ny = y * 2.1f + 9.2f;
+        x = nx; y = ny; a *= 0.5f;
+    }
+    return v;
+}
+
+static void render_smoke_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.4f;
+    for (int py = 0; py < hh; py++) {
+        float uvy = (float)py / hh * 4.0f;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = (float)px / hw * 4.0f;
+            float cx = fbm2d(uvx + t + p->bass * 2, uvy);
+            float cy = fbm2d(uvx, uvy + t + p->mid);
+            float n = fbm2d(uvx + cx * 1.5f + t * 0.3f, uvy + cy * 1.5f - t * 0.2f);
+            n += p->beat * 0.3f * fbm2d(uvx * 3 + t * 2, uvy * 3);
+            float hue = fmodf((n * 0.5f + cx * 0.3f + t * 0.05f) * 360, 360);
+            if (hue < 0) hue += 360;
+            float val = clamp01(n * 0.8f + 0.2f + p->energy * 0.3f);
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.6f + p->energy * 0.3f, val, &r, &g, &b);
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== PRESET 22: Neon Polyhedra (half-res) ======== */
+static void render_polyhedra_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    float a1 = t * 0.5f + p->bass, a2 = t * 0.3f + p->treble;
+    float ca1 = cosf(a1), sa1 = sinf(a1), ca2 = cosf(a2), sa2 = sinf(a2);
+    float sz = 0.8f + p->bass * 0.3f + p->beat * 0.15f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 2.0f;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 2.0f * aspect;
+            /* Raymarching: ro=(0,0,-3), rd=normalize(uvx,uvy,1.5) */
+            float rdl = sqrtf(uvx * uvx + uvy * uvy + 2.25f);
+            float rdx = uvx / rdl, rdy = uvy / rdl, rdz = 1.5f / rdl;
+            float rt = 0, glow = 0;
+            for (int i = 0; i < 40; i++) {
+                float px3 = rdx * rt, py3 = rdy * rt, pz3 = -3.0f + rdz * rt;
+                /* Rotate */
+                float qx = px3 * ca1 - pz3 * sa1;
+                float tmp = px3 * sa1 + pz3 * ca1;
+                float qy = py3 * ca2 - tmp * sa2;
+                float qz = py3 * sa2 + tmp * ca2;
+                /* Box distance */
+                float dx = fabsf(qx) - sz, dy = fabsf(qy) - sz, dz = fabsf(qz) - sz;
+                float maxd = fmaxf(dx, fmaxf(dy, dz));
+                float ox = fmaxf(dx, 0), oy = fmaxf(dy, 0), oz = fmaxf(dz, 0);
+                float dbox = fminf(maxd, 0) + sqrtf(ox*ox+oy*oy+oz*oz);
+                float edge_box = fabsf(dbox) - 0.01f;
+                /* Octahedron distance */
+                float ax = fabsf(qx), ay = fabsf(qy), az = fabsf(qz);
+                float docta = (ax + ay + az - sz * 1.3f) * 0.57735f;
+                float edge_oct = fabsf(docta) - 0.01f;
+                float d = fminf(edge_box, edge_oct);
+                glow += 0.005f / (fabsf(d) + 0.01f);
+                if (d < 0.001f) break;
+                rt += d;
+                if (rt > 10.0f) break;
+            }
+            glow = clamp01(glow * (0.3f + p->energy * 0.7f + p->beat * 0.3f));
+            float hue = fmodf(t * 29 + glow * 108 + p->bass * 72, 360);
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.7f, glow, &r, &g, &b);
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== COMBO 23: Inferno Tunnel (half-res) ======== */
+static void render_infernotunnel_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.5f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f);
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * aspect;
+            float dist = sqrtf(uvx*uvx+uvy*uvy) + 0.001f;
+            float angle = atan2f(uvy, uvx);
+            float tunnel = 1.0f / dist;
+            float pattern = sinf(tunnel * 2 - t * 3 + angle * 3) * 0.5f + 0.5f;
+            float n1 = noise2d(angle * 3 + t, tunnel * 2 - t * 2);
+            float n2 = noise2d(angle * 6, tunnel * 4 - t * 3) * 0.5f;
+            float flame = (n1 + n2) * pattern * (1 + p->bass * 1.5f + p->beat * 0.8f);
+            flame /= (dist * 3 + 0.3f);
+            flame = clamp01(flame);
+            uint8_t r, g, b;
+            if (flame < 0.33f) { r = clamp8((int)(flame*3*179)); g = 0; b = clamp8((int)(flame*3*38)); }
+            else if (flame < 0.66f) { float f=(flame-0.33f)*3; r=clamp8(179+(int)(f*76)); g=clamp8((int)(f*128)); b=clamp8(38-(int)(f*26)); }
+            else { float f=(flame-0.66f)*3; r=255; g=clamp8(128+(int)(f*127)); b=clamp8(13+(int)(f*242)); }
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== COMBO 24: Galaxy Ripple (half-res) ======== */
+static void render_galaxyripple_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.2f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float y = ((float)py / hh - 0.5f) * 2;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float x = ((float)px / hw - 0.5f) * 2 * aspect;
+            float dist = sqrtf(x*x+y*y) + 0.001f, angle = atan2f(y, x);
+            float arm = powf(sinf(angle*2-logf(dist)*4+t*3)*0.5f+0.5f, 2.0f - p->bass);
+            float core = expf(-dist*dist*4) * (1 + p->bass * 2);
+            float galaxy = arm * (0.3f + 0.7f / (dist * 3 + 0.5f)) + core;
+            float ripple = (sinf(dist*20-p->time_acc*4+p->bass*6)*0.5f+0.5f)
+                         * (sinf(dist*12-p->time_acc*2.5f)*0.3f+0.7f);
+            float val = clamp01(galaxy*(0.6f+ripple*0.4f) + p->beat*0.15f/(dist*3+0.3f));
+            float hue = fmodf((angle*57.3f*0.159f + dist*100 + t*40 + ripple*36), 360);
+            if (hue < 0) hue += 360;
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.7f + 0.3f * (1 - core), val, &r, &g, &b);
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== COMBO 25: Storm Vortex (half-res) ======== */
+static void render_stormvortex_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.5f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float y = ((float)py / hh - 0.5f) * 2;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float x = ((float)px / hw - 0.5f) * 2 * aspect;
+            float dist = sqrtf(x*x+y*y) + 0.001f, angle = atan2f(y, x);
+            float twist = t * 3 + (1.0f / dist) * (1 + p->bass * 2 + p->beat);
+            float ta = angle + twist;
+            float bolt = 0;
+            for (int arm = 0; arm < 6; arm++) {
+                float aa = arm * 1.0472f + t * 0.4f;
+                float diff = fmodf(ta - aa * (dist + 0.5f) + M_PI, 2*M_PI) - M_PI;
+                float w = 0.04f + noise2d(dist*10+t*3, arm*7) * 0.06f * p->energy;
+                bolt += expf(-diff*diff/(w*w)) * (1 - dist * 0.3f);
+            }
+            bolt = clamp01(bolt * (0.5f + p->energy * 0.5f));
+            float spiral = sinf(ta * 4 + dist * 10) * 0.5f + 0.5f;
+            float val = fmaxf(bolt, spiral * 0.3f / (dist * 2 + 0.3f));
+            val += expf(-dist*dist*8) * p->bass * 0.5f + p->beat * 0.2f / (dist*3+0.3f);
+            val = clamp01(val);
+            float hue = fmodf(216 + bolt * 72 + dist * 36 + t * 18, 360);
+            uint8_t r, g, b;
+            hsv_fast(hue, 0.5f + bolt * 0.3f, val, &r, &g, &b);
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== COMBO 26: Plasma Aurora (half-res) ======== */
+static void render_plasmaaurora_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.4f;
+    for (int py = 0; py < hh; py++) {
+        float uvy = (float)py / hh;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = (float)px / hw;
+            float v = (sinf(uvx*10+t+p->bass*5) + sinf(uvy*10+t*0.5f)
+                      + sinf(sqrtf((uvx-0.5f)*(uvx-0.5f)+(uvy-0.5f)*(uvy-0.5f))*12+t)
+                      + sinf(sqrtf((uvx-0.8f)*(uvx-0.8f)+(uvy-0.3f)*(uvy-0.3f))*8)) * 0.25f;
+            float curtain = 0;
+            for (int l = 0; l < 3; l++) {
+                float fl = (float)l;
+                float wave = sinf(uvx*6+t*(1+fl*0.3f)+p->bass*3)*0.5f + sinf(uvx*15+t*1.5f+fl)*0.3f;
+                float center = 0.7f - wave * 0.12f - fl * 0.05f;
+                float d = uvy - center;
+                curtain += expf(-d*d*60) * (0.5f + v * 0.5f);
+            }
+            /* Blend plasma and aurora */
+            float pr = sinf(v*M_PI+p->energy*2)*0.5f+0.5f;
+            float pg = sinf(v*M_PI+2.094f+p->bass*3)*0.5f+0.5f;
+            float pb = sinf(v*M_PI+4.188f+p->treble*2)*0.5f+0.5f;
+            float mix = clamp01(curtain * 1.5f);
+            float hue = fmodf(100+curtain*80+uvx*30+t*10, 360);
+            float aval = clamp01(curtain);
+            uint8_t ar, ag, ab;
+            hsv_fast(hue, 0.8f, aval, &ar, &ag, &ab);
+            uint8_t r = clamp8((int)((1-mix)*pr*102 + mix*ar + p->beat*20));
+            uint8_t g = clamp8((int)((1-mix)*pg*102 + mix*ag + p->beat*20));
+            uint8_t b = clamp8((int)((1-mix)*pb*102 + mix*ab + p->beat*20));
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== COMBO 27: Fractal Fire (half-res) ======== */
+static void render_fractalfire_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    float cx = -0.75f + sinf(t * 0.2f) * 0.1f;
+    float cy = 0.15f + cosf(t * 0.15f) * 0.1f + p->bass * 0.08f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 2.5f;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 2.5f * aspect;
+            float zx = uvx, zy = uvy;
+            int iter = 0;
+            for (; iter < 48; iter++) {
+                float zx2 = zx*zx - zy*zy + cx;
+                zy = 2*zx*zy + cy; zx = zx2;
+                if (zx*zx+zy*zy > 4) break;
+            }
+            float f = (float)iter / 48.0f;
+            float flame = clamp01(f * (1 + p->energy + p->beat * 0.5f));
+            uint8_t r, g, b;
+            if (f >= 1.0f) { r=3; g=0; b=5; }
+            else if (flame < 0.25f) { r=clamp8((int)(flame*4*179)); g=0; b=0; }
+            else if (flame < 0.5f) { float g2=(flame-0.25f)*4; r=clamp8(179+(int)(g2*76)); g=clamp8((int)(g2*128)); b=0; }
+            else if (flame < 0.75f) { float g2=(flame-0.5f)*4; r=255; g=clamp8(128+(int)(g2*127)); b=clamp8((int)(g2*51)); }
+            else { float g2=(flame-0.75f)*4; r=255; g=255; b=clamp8(51+(int)(g2*204)); }
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== NEXT-LEVEL 28: Bouncing Fireballs (half-res) ======== */
+static void render_fireballs_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    memset(hb, 2, hw * hh * 4); /* near-black */
+    float t = p->time_acc;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = (float)py / hh;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = (float)px / hw;
+            float cr = 0, cg = 0, cb = 0;
+            for (int i = 0; i < 40; i++) {
+                float fi = (float)i;
+                float phase = fi * 0.618f + fi * fi * 0.01f;
+                float bx = 0.5f + sinf(phase + t * (0.5f + fi * 0.03f)) * (0.35f + fi * 0.003f);
+                float gravity_t = fmodf(t * (0.8f + fi * 0.05f) + phase, M_PI);
+                float by = 0.15f + fabsf(sinf(gravity_t)) * (0.5f + p->bass * 0.3f + p->beat * 0.15f);
+                float dx = (uvx - bx) * aspect, dy = uvy - by;
+                float d = dx * dx + dy * dy;
+                float sz = 0.001f + p->energy * 0.0005f + p->beat * 0.0008f;
+                float brightness = sz / (d + 0.0001f);
+                int band = ((int)(fi * 3) % NUM_BANDS);
+                brightness *= 0.5f + p->smooth_bands[band] * 1.0f;
+                int color_type = (int)fi % 3;
+                if (color_type == 0) { cr += brightness; cg += brightness * 0.3f; cb += brightness * 0.05f; }
+                else if (color_type == 1) { cr += brightness * 0.2f; cg += brightness * 0.5f; cb += brightness; }
+                else { cr += brightness * 0.1f; cg += brightness; cb += brightness * 0.3f; }
+            }
+            uint8_t r = clamp8((int)(cr * 255));
+            uint8_t g = clamp8((int)(cg * 255));
+            uint8_t b = clamp8((int)(cb * 255));
+            put_pixel(row + px * 4, r, g, b);
+        }
+    }
+}
+
+/* ======== NEXT-LEVEL 29: Shockwave (half-res) ======== */
+static void render_shockwave_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 2;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 2 * aspect;
+            float dist = sqrtf(uvx*uvx + uvy*uvy);
+            float cr = 0, cg = 0, cb = 0;
+            for (int ring = 0; ring < 12; ring++) {
+                float fr = (float)ring;
+                float birth = fr * 0.5f + floorf(t / 0.5f) * 0.5f - fmodf(fr, 3) * 0.17f;
+                float age = t - birth;
+                if (age < 0 || age > 2.5f) continue;
+                float radius = age * (1 + p->bass * 0.8f + p->beat * 0.5f);
+                float thick = 0.03f + age * 0.01f;
+                float rd = fabsf(dist - radius);
+                float intensity = (1 - age / 2.5f) * expf(-rd*rd/(thick*thick));
+                intensity *= (0.5f + p->energy);
+                float hue = fmodf(fr * 29 + age * 72 + t * 18, 360);
+                uint8_t hr, hg, hb2;
+                hsv_fast(hue, 0.8f, 1.0f, &hr, &hg, &hb2);
+                cr += hr / 255.0f * intensity;
+                cg += hg / 255.0f * intensity;
+                cb += hb2 / 255.0f * intensity;
+            }
+            /* Beat flash at center */
+            cr += p->beat * 0.3f * expf(-dist*dist*8) * 1.0f;
+            cg += p->beat * 0.3f * expf(-dist*dist*8) * 0.8f;
+            cb += p->beat * 0.3f * expf(-dist*dist*8) * 0.5f;
+            put_pixel(row + px * 4, clamp8((int)(cr*255)), clamp8((int)(cg*255)), clamp8((int)(cb*255)));
+        }
+    }
+}
+
+/* ======== NEXT-LEVEL 30: DNA Helix (half-res) ======== */
+static void render_dna_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.8f;
+    float aspect = (float)hw / hh;
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 2;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 2 * aspect;
+            float cr = 0.01f, cg = 0.005f, cb = 0.03f;
+            float scroll = uvy * 8 + t * 2;
+            float s1x = sinf(scroll) * 0.3f;
+            float s2x = sinf(scroll + M_PI) * 0.3f;
+            float d1 = fabsf(uvx - s1x);
+            float d2 = fabsf(uvx - s2x);
+            float e = 0.5f + p->energy;
+            cr += 0.2f * 0.006f / (d1 + 0.003f) * e;
+            cg += 0.6f * 0.006f / (d1 + 0.003f) * e;
+            cb += 1.0f * 0.006f / (d1 + 0.003f) * e;
+            cr += 1.0f * 0.006f / (d2 + 0.003f) * e;
+            cg += 0.3f * 0.006f / (d2 + 0.003f) * e;
+            cb += 0.5f * 0.006f / (d2 + 0.003f) * e;
+            float rp = fmodf(scroll, 1.0f);
+            if (rp >= 0 && rp < 0.15f) {
+                float ry = floorf(scroll);
+                int bi = (int)(fmodf(fabsf(ry), 64));
+                float bv = p->smooth_bands[bi % NUM_BANDS];
+                float rx1 = sinf(ry + t*2) * 0.3f;
+                float rx2 = sinf(ry + t*2 + M_PI) * 0.3f;
+                float mnx = fminf(rx1, rx2), mxx = fmaxf(rx1, rx2);
+                if (uvx > mnx && uvx < mxx) {
+                    float rg = (1 - fabsf(rp - 0.075f) / 0.075f) * bv * (0.5f + p->beat * 0.5f);
+                    float hue = fmodf(ry * 18 + t * 36, 360);
+                    uint8_t hr2, hg2, hb2;
+                    hsv_fast(hue, 0.7f, 1.0f, &hr2, &hg2, &hb2);
+                    cr += hr2 / 255.0f * rg * 0.8f;
+                    cg += hg2 / 255.0f * rg * 0.8f;
+                    cb += hb2 / 255.0f * rg * 0.8f;
+                }
+            }
+            put_pixel(row + px * 4, clamp8((int)(cr*255)), clamp8((int)(cg*255)), clamp8((int)(cb*255)));
+        }
+    }
+}
+
+/* ======== NEXT-LEVEL 31: Lightning Web (half-res) ======== */
+static void render_lightningweb_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc;
+    float aspect = (float)hw / hh;
+    /* Pre-compute 8 node positions */
+    float nx[8], ny[8];
+    for (int i = 0; i < 8; i++) {
+        float fi = (float)i;
+        nx[i] = sinf(fi*2.4f + t*0.5f + fi) * 0.7f;
+        ny[i] = cosf(fi*1.7f + t*0.4f + fi*fi*0.3f) * 0.7f;
+    }
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 2;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 2 * aspect;
+            float cr = 0.01f, cg = 0.005f, cb = 0.03f;
+            for (int i = 0; i < 8; i++) {
+                for (int j = i+1; j < 8; j++) {
+                    int band = (i*8+j) % NUM_BANDS;
+                    float le = p->smooth_bands[band];
+                    if (le < 0.15f) continue;
+                    float ax = nx[i], ay = ny[i], bx = nx[j], by = ny[j];
+                    float abx = bx-ax, aby = by-ay;
+                    float abl = sqrtf(abx*abx+aby*aby) + 0.001f;
+                    float adx = abx/abl, ady = aby/abl;
+                    float pax = uvx-ax, pay = uvy-ay;
+                    float proj = pax*adx + pay*ady;
+                    if (proj < 0) proj = 0; if (proj > abl) proj = abl;
+                    float clx = ax + adx*proj, cly = ay + ady*proj;
+                    float jag = noise2d(proj*20+((i+j)*5), t*5) * 0.04f * (1+p->beat);
+                    float perpd = fabsf((uvx-clx)*(-ady) + (uvy-cly)*adx);
+                    float d = fmaxf(perpd - jag, 0);
+                    float glow = 0.003f / (d + 0.002f) * le * (0.5f + p->energy + p->beat*0.5f);
+                    float hue = fmodf(216 + i * 18 + t * 11, 360);
+                    uint8_t hr2, hg2, hb2;
+                    hsv_fast(hue, 0.5f, 1.0f, &hr2, &hg2, &hb2);
+                    cr += hr2/255.0f * glow;
+                    cg += hg2/255.0f * glow;
+                    cb += hb2/255.0f * glow;
+                }
+                /* Node glow */
+                float nd = sqrtf((uvx-nx[i])*(uvx-nx[i])+(uvy-ny[i])*(uvy-ny[i]));
+                float ng = 0.008f / (nd + 0.005f) * (0.5f + p->energy);
+                cr += 0.8f * ng; cg += 0.9f * ng; cb += 1.0f * ng;
+            }
+            put_pixel(row + px * 4, clamp8((int)(cr*255)), clamp8((int)(cg*255)), clamp8((int)(cb*255)));
+        }
+    }
+}
+
+/* ======== NEXT-LEVEL 32: Constellation (half-res) ======== */
+static void render_constellation_half(auraviz_thread_t *p, uint8_t *hb, int hw, int hh)
+{
+    float t = p->time_acc * 0.3f;
+    float aspect = (float)hw / hh;
+    /* Pre-compute 20 star positions */
+    float sx[20], sy[20];
+    for (int i = 0; i < 20; i++) {
+        float fi = (float)i;
+        sx[i] = sinf(fi*3.7f + t*0.2f + sinf(t*0.1f+fi)) * 0.8f;
+        sy[i] = cosf(fi*2.3f + t*0.15f + cosf(t*0.12f+fi*0.7f)) * 0.8f;
+    }
+    for (int py = 0; py < hh; py++) {
+        float uvy = ((float)py / hh - 0.5f) * 2;
+        uint8_t *row = hb + py * hw * 4;
+        for (int px = 0; px < hw; px++) {
+            float uvx = ((float)px / hw - 0.5f) * 2 * aspect;
+            float cr = 0.005f, cg = 0.005f, cb = 0.02f;
+            /* Lines between close stars */
+            for (int i = 0; i < 20; i++) {
+                for (int j = i+1; j < 20; j++) {
+                    float ldx = sx[i]-sx[j], ldy = sy[i]-sy[j];
+                    float ld = sqrtf(ldx*ldx+ldy*ldy);
+                    if (ld > 0.6f) continue;
+                    int band = (i+j*3) % NUM_BANDS;
+                    float bri = p->smooth_bands[band] * (1 - ld / 0.6f);
+                    if (bri < 0.05f) continue;
+                    float ax = sx[i], ay = sy[i], bx = sx[j], by = sy[j];
+                    float abx = bx-ax, aby = by-ay;
+                    float abl = sqrtf(abx*abx+aby*aby) + 0.001f;
+                    float adx = abx/abl, ady = aby/abl;
+                    float pax = uvx-ax, pay = uvy-ay;
+                    float proj = pax*adx + pay*ady;
+                    if (proj < 0) proj = 0; if (proj > abl) proj = abl;
+                    float clx = ax + adx*proj, cly = ay + ady*proj;
+                    float dd = sqrtf((uvx-clx)*(uvx-clx)+(uvy-cly)*(uvy-cly));
+                    float glow = 0.001f / (dd + 0.001f) * bri * 0.5f;
+                    cr += 0.5f * glow; cg += 0.5f * glow; cb += 0.8f * glow;
+                }
+            }
+            /* Star glows */
+            for (int i = 0; i < 20; i++) {
+                float dd = sqrtf((uvx-sx[i])*(uvx-sx[i])+(uvy-sy[i])*(uvy-sy[i]));
+                float band = (float)i / 20.0f;
+                int bi = (int)(band * NUM_BANDS) % NUM_BANDS;
+                float pulse = 0.5f + p->smooth_bands[bi] * 0.5f + p->beat * 0.2f;
+                float sg = 0.003f / (dd + 0.002f) * pulse;
+                float twinkle = sinf(i * 7.0f + t * 3) * 0.3f + 0.7f;
+                cr += 0.9f * sg * twinkle;
+                cg += 0.95f * sg * twinkle;
+                cb += 1.0f * sg * twinkle;
+            }
+            /* Background nebula hint */
+            float bg = noise2d(uvx * 5 + t * 0.1f, uvy * 5) * 0.02f;
+            cr += bg; cg += bg * 0.75f; cb += bg * 2;
+            put_pixel(row + px * 4, clamp8((int)(cr*255)), clamp8((int)(cg*255)), clamp8((int)(cb*255)));
+        }
+    }
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  RENDER THREAD
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -1383,6 +1885,32 @@ static void *Thread(void *p_data)
             case 18: render_diamonds_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
                      upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
             case 19: render_vortex_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 20: render_julia_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 21: render_smoke_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 22: render_polyhedra_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 23: render_infernotunnel_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 24: render_galaxyripple_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 25: render_stormvortex_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 26: render_plasmaaurora_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 27: render_fractalfire_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 28: render_fireballs_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 29: render_shockwave_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 30: render_dna_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 31: render_lightningweb_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
+                     upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
+            case 32: render_constellation_half(p_thread, p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h);
                      upscale_half(p_thread->p_halfbuf, p_thread->half_w, p_thread->half_h, pix, w, h, pp); break;
         }
 
