@@ -25,9 +25,6 @@
 # include <winsock2.h>
 # include <ws2tcpip.h>
 # include <windows.h>
-# if !defined(poll)
-#  define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
-# endif
 #endif
 
 #include <vlc_common.h>
@@ -92,29 +89,10 @@ vlc_module_end ()
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  GL FUNCTION POINTERS (loaded at runtime via wglGetProcAddress)
+ *
+ *  MinGW's glext.h already provides the PFN typedefs, so we just declare
+ *  our function pointer variables using those types.
  * ══════════════════════════════════════════════════════════════════════════ */
-
-/* We need these because MinGW's opengl32 only exports GL 1.1.
- * Everything else must be loaded via wglGetProcAddress. */
-
-typedef GLuint (APIENTRY *PFNGLCREATESHADERPROC)(GLenum);
-typedef void   (APIENTRY *PFNGLSHADERSOURCEPROC)(GLuint, GLsizei, const GLchar**, const GLint*);
-typedef void   (APIENTRY *PFNGLCOMPILESHADERPROC)(GLuint);
-typedef void   (APIENTRY *PFNGLGETSHADERIVPROC)(GLuint, GLenum, GLint*);
-typedef void   (APIENTRY *PFNGLGETSHADERINFOLOGPROC)(GLuint, GLsizei, GLsizei*, GLchar*);
-typedef GLuint (APIENTRY *PFNGLCREATEPROGRAMPROC)(void);
-typedef void   (APIENTRY *PFNGLATTACHSHADERPROC)(GLuint, GLuint);
-typedef void   (APIENTRY *PFNGLLINKPROGRAMPROC)(GLuint);
-typedef void   (APIENTRY *PFNGLGETPROGRAMIVPROC)(GLuint, GLenum, GLint*);
-typedef void   (APIENTRY *PFNGLGETPROGRAMINFOLOGPROC)(GLuint, GLsizei, GLsizei*, GLchar*);
-typedef void   (APIENTRY *PFNGLUSEPROGRAMPROC)(GLuint);
-typedef void   (APIENTRY *PFNGLDELETESHADERPROC)(GLuint);
-typedef void   (APIENTRY *PFNGLDELETEPROGRAMPROC)(GLuint);
-typedef GLint  (APIENTRY *PFNGLGETUNIFORMLOCATIONPROC)(GLuint, const GLchar*);
-typedef void   (APIENTRY *PFNGLUNIFORM1FPROC)(GLint, GLfloat);
-typedef void   (APIENTRY *PFNGLUNIFORM1IPROC)(GLint, GLint);
-typedef void   (APIENTRY *PFNGLUNIFORM2FPROC)(GLint, GLfloat, GLfloat);
-typedef void   (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum);
 
 static PFNGLCREATESHADERPROC        gl_CreateShader;
 static PFNGLSHADERSOURCEPROC        gl_ShaderSource;
@@ -886,14 +864,33 @@ static const char *frag_vortex =
     "    gl_FragColor = vec4(hsv2rgb(vec3(hue, 0.7+0.3*u_energy, val)), 1.0);\n"
     "}\n";
 
-/* Array of all fragment bodies */
-static const char *frag_bodies[NUM_PRESETS] = {
-    frag_spectrum, frag_wave, frag_circular, frag_particles,
-    frag_nebula, frag_plasma, frag_tunnel, frag_kaleidoscope,
-    frag_lava, frag_starburst, frag_storm, frag_ripple,
-    frag_fractalwarp, frag_galaxy, frag_glitch, frag_aurora,
-    frag_pulsegrid, frag_fire, frag_diamonds, frag_vortex
-};
+/* Get fragment body for a given preset index */
+static const char *get_frag_body(int preset)
+{
+    switch (preset) {
+        case 0:  return frag_spectrum;
+        case 1:  return frag_wave;
+        case 2:  return frag_circular;
+        case 3:  return frag_particles;
+        case 4:  return frag_nebula;
+        case 5:  return frag_plasma;
+        case 6:  return frag_tunnel;
+        case 7:  return frag_kaleidoscope;
+        case 8:  return frag_lava;
+        case 9:  return frag_starburst;
+        case 10: return frag_storm;
+        case 11: return frag_ripple;
+        case 12: return frag_fractalwarp;
+        case 13: return frag_galaxy;
+        case 14: return frag_glitch;
+        case 15: return frag_aurora;
+        case 16: return frag_pulsegrid;
+        case 17: return frag_fire;
+        case 18: return frag_diamonds;
+        case 19: return frag_vortex;
+        default: return frag_spectrum;
+    }
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  SHADER COMPILATION
@@ -1060,7 +1057,7 @@ static void *Thread(void *p_data)
     /* Compile all 20 preset shaders */
     int shader_ok = 0;
     for (int i = 0; i < NUM_PRESETS; i++) {
-        p->programs[i] = build_program(frag_bodies[i], p->p_obj);
+        p->programs[i] = build_program(get_frag_body(i), p->p_obj);
         if (p->programs[i]) shader_ok++;
     }
     msg_Info(p->p_obj, "AuraViz GL: compiled %d/%d shaders", shader_ok, NUM_PRESETS);
