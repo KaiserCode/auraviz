@@ -44,7 +44,7 @@ jobs:
             -o libauraviz_plugin.dll \
             auraviz.c \
             $(pkg-config --libs vlc-plugin) \
-            -lopengl32 -lm -lws2_32 \
+            -lm -lws2_32 \
             -Wl,-Bstatic -lpthread -Wl,-Bdynamic
         
         echo "=== Compiling auraviz_gl (OpenGL) ==="
@@ -54,7 +54,7 @@ jobs:
             -o libauraviz_gl_plugin.dll \
             auraviz_gl.c \
             $(pkg-config --libs vlc-plugin) \
-            -lopengl32 -lm -lws2_32 \
+            -lopengl32 -lgdi32 -luser32 -lm -lws2_32 \
             -Wl,-Bstatic -lpthread -Wl,-Bdynamic
         
         echo "=== Done ==="
