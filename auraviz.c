@@ -20,6 +20,12 @@
 # include <winsock2.h>
 # include <ws2tcpip.h>
 # include <windows.h>
+/* VLC's vlc_threads.h calls poll() which doesn't exist on Windows.
+   Provide it before VLC headers are included. */
+static inline int _auraviz_poll(struct pollfd *fds, unsigned long nfds, int timeout) {
+    return WSAPoll(fds, nfds, timeout);
+}
+# define poll(fds, nfds, timeout) _auraviz_poll((fds), (nfds), (timeout))
 #endif
 
 #include <vlc_common.h>
