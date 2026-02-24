@@ -958,16 +958,63 @@ static GLuint build_program(const char *frag_body, vlc_object_t *obj)
 
 static const wchar_t WNDCLASS_NAME[] = L"AuraVizGLClass";
 
+/* Store resize info so the render loop can pick it up */
+static volatile int g_resize_w = 0, g_resize_h = 0;
+static volatile bool g_resized = false;
+static volatile bool g_fullscreen = false;
+static WINDOWPLACEMENT g_wp_prev = { sizeof(WINDOWPLACEMENT) };
+
+static void toggle_fullscreen(HWND hwnd)
+{
+    DWORD style = GetWindowLong(hwnd, GWL_STYLE);
+    if (!g_fullscreen) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetWindowPlacement(hwnd, &g_wp_prev) &&
+            GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+            SetWindowPos(hwnd, HWND_TOP,
+                         mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+        g_fullscreen = true;
+    } else {
+        SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &g_wp_prev);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+        case WM_SIZE: {
+            int w = LOWORD(lp), h = HIWORD(lp);
+            if (w > 0 && h > 0) {
+                g_resize_w = w;
+                g_resize_h = h;
+                g_resized = true;
+            }
+            return 0;
+        }
+        case WM_LBUTTONDBLCLK:
+            toggle_fullscreen(hwnd);
+            return 0;
         case WM_CLOSE:
-            /* Don't destroy — let the thread handle shutdown */
             ShowWindow(hwnd, SW_HIDE);
             return 0;
         case WM_KEYDOWN:
             if (wp == VK_ESCAPE) {
-                ShowWindow(hwnd, SW_HIDE);
+                if (g_fullscreen) toggle_fullscreen(hwnd);
+                else ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            if (wp == VK_F11 || wp == 'F') {
+                toggle_fullscreen(hwnd);
                 return 0;
             }
             break;
@@ -979,7 +1026,7 @@ static HWND create_gl_window(int w, int h)
 {
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
-    wc.style = CS_OWNDC;
+    wc.style = CS_OWNDC | CS_DBLCLKS;  /* CS_DBLCLKS for double-click support */
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -991,7 +1038,7 @@ static HWND create_gl_window(int w, int h)
     RECT r = {0, 0, w, h};
     AdjustWindowRect(&r, style, FALSE);
 
-    HWND hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz GL",
+    HWND hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz",
                                 style, CW_USEDEFAULT, CW_USEDEFAULT,
                                 r.right - r.left, r.bottom - r.top,
                                 NULL, NULL, GetModuleHandle(NULL), NULL);
@@ -1085,6 +1132,9 @@ static void *Thread(void *p_data)
     glViewport(0, 0, p->i_width, p->i_height);
     glDisable(GL_DEPTH_TEST);
 
+    /* Track current render dimensions (may change on resize) */
+    int cur_w = p->i_width, cur_h = p->i_height;
+
     p->gl_ready = true;
 
     for (;;) {
@@ -1093,6 +1143,14 @@ static void *Thread(void *p_data)
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
+        }
+
+        /* Handle resize */
+        if (g_resized) {
+            cur_w = g_resize_w;
+            cur_h = g_resize_h;
+            glViewport(0, 0, cur_w, cur_h);
+            g_resized = false;
         }
 
         /* Get audio block */
@@ -1163,7 +1221,7 @@ static void *Thread(void *p_data)
         /* Set uniforms */
         gl_Uniform1f(gl_GetUniformLocation(prog, "u_time"), p->time_acc);
         gl_Uniform2f(gl_GetUniformLocation(prog, "u_resolution"),
-                     (float)p->i_width, (float)p->i_height);
+                     (float)cur_w, (float)cur_h);
         gl_Uniform1f(gl_GetUniformLocation(prog, "u_bass"), p->bass);
         gl_Uniform1f(gl_GetUniformLocation(prog, "u_mid"), p->mid);
         gl_Uniform1f(gl_GetUniformLocation(prog, "u_treble"), p->treble);
