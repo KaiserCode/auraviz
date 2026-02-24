@@ -200,25 +200,28 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
         if (mag > frame_max) frame_max = mag;
     }
 
-    /* Automatic gain control: track recent peak with slow decay */
+    /* User-adjustable gain controls AGC sensitivity:
+       Low gain = AGC holds high peak (more dynamic range, bars stay lower)
+       High gain = AGC drops fast (bars fill more, less dynamic range) */
+    float gain_pct = p->gain / 100.0f;
+    float agc_decay = 0.999f - gain_pct * 0.009f;  /* 0.999 (slow/low) to 0.990 (fast/high) */
+
+    /* Automatic gain control */
     if (frame_max > p->agc_peak)
         p->agc_peak = frame_max;
     else
-        p->agc_peak *= 0.995f;  /* decay ~0.5% per frame */
+        p->agc_peak *= agc_decay;
     if (p->agc_peak < 0.0001f) p->agc_peak = 0.0001f;
-
-    /* User-adjustable gain: 0-100 maps to 0.5x - 8x multiplier */
-    float gain_mult = 0.5f + (p->gain / 100.0f) * 7.5f;
 
     /* User-adjustable smoothing: 0-100 maps attack/release curves */
     float smooth_pct = p->smooth / 100.0f;
     float attack  = 0.9f - smooth_pct * 0.5f;   /* 0.9 (sharp) to 0.4 (smooth) */
     float release = 0.05f + smooth_pct * 0.25f;  /* 0.05 (sharp) to 0.3 (smooth) */
 
-    /* Normalize bands relative to AGC peak, apply gain */
+    /* Normalize bands relative to AGC peak */
     for (int band = 0; band < NUM_BANDS; band++) {
         float norm = raw_mag[band] / p->agc_peak;
-        float val = sqrtf(norm) * gain_mult;
+        float val = sqrtf(norm);
         if (val > 1.0f) val = 1.0f;
 
         /* Smooth: user-controlled attack/release */
