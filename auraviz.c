@@ -486,14 +486,25 @@ static const char *frag_polyhedra =
 static const char *frag_infernotunnel =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float dist=length(uv)+0.001,angle=atan(uv.y,uv.x),t=u_time*0.5,tunnel=1.0/dist;\n"
-    "    float pattern=sin(tunnel*2.0-t*3.0+angle*3.0)*0.5+0.5;\n"
-    "    float n1=noise(vec2(angle*3.0+t,tunnel*2.0-t*2.0)),n2=noise(vec2(angle*6.0,tunnel*4.0-t*3.0))*0.5;\n"
-    "    float flame=clamp((n1+n2)*pattern*(1.0+u_bass*1.5+u_beat*0.8)/(dist*3.0+0.3),0.0,1.0);\n"
-    "    vec3 col; if(flame<0.33) col=vec3(flame*3.0*0.7,0,flame*3.0*0.15);\n"
-    "    else if(flame<0.66){float f=(flame-0.33)*3.0;col=vec3(0.7+f*0.3,f*0.5,0.15-f*0.1);}\n"
-    "    else{float f=(flame-0.66)*3.0;col=vec3(1,0.5+f*0.5,0.05+f*0.95);}\n"
-    "    gl_FragColor = vec4(col, 1.0);\n}\n";
+    "    float dist=length(uv)+0.001, t=u_time*0.5, tunnel=1.0/dist;\n"
+    "    vec2 polar=vec2(tunnel, atan(uv.y,uv.x));\n"
+    "    float n1=noise(vec2(polar.y*1.5+sin(polar.y)*0.5+t, tunnel*2.0-t*2.5));\n"
+    "    float n2=noise(vec2(polar.y*3.0+cos(polar.y*2.0), tunnel*4.0-t*3.5))*0.5;\n"
+    "    float n3=noise(vec2(polar.y*0.8+t*0.5, tunnel*1.5+t*0.3))*0.3;\n"
+    "    float swirl=sin(tunnel*2.5-t*3.0+polar.y*2.0+sin(polar.y*3.0)*0.5)*0.5+0.5;\n"
+    "    float flame=clamp((n1+n2+n3)*swirl*(1.2+u_bass*1.5+u_beat*0.8)/(dist*2.5+0.2),0.0,1.0);\n"
+    "    float depth=1.0/(dist*3.0+0.3);\n"
+    "    vec3 hot=vec3(1.0,0.95,0.8);\n"
+    "    vec3 mid1=vec3(1.0,0.45,0.05);\n"
+    "    vec3 mid2=vec3(0.8,0.15,0.05);\n"
+    "    vec3 cool=vec3(0.5,0.08,0.15);\n"
+    "    vec3 col;\n"
+    "    if(flame<0.25) col=mix(cool,mid2,flame*4.0);\n"
+    "    else if(flame<0.5) col=mix(mid2,mid1,(flame-0.25)*4.0);\n"
+    "    else if(flame<0.75) col=mix(mid1,hot,(flame-0.5)*4.0);\n"
+    "    else col=mix(hot,vec3(1.0,1.0,0.9),(flame-0.75)*4.0);\n"
+    "    col*=(0.6+depth*0.8)*(1.0+u_energy*0.3);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_galaxyripple =
     "void main() {\n"
