@@ -679,31 +679,68 @@ static const char *get_frag_body(int preset) {
 }
 
 /* ══ VLC Window Discovery ══ */
-typedef struct { HWND found; int best_area; } find_video_t;
+typedef struct { HWND found; int best_area; DWORD pid; } find_video_t;
 
-static BOOL CALLBACK find_video_child(HWND hwnd, LPARAM lp) {
+static BOOL CALLBACK find_biggest_child(HWND hwnd, LPARAM lp) {
     find_video_t *ctx = (find_video_t *)lp;
     if (!IsWindowVisible(hwnd)) return TRUE;
-    RECT r; GetClientRect(hwnd, &r);
-    int area = (r.right-r.left) * (r.bottom-r.top);
+    RECT r;
+    GetClientRect(hwnd, &r);
+    int area = (r.right - r.left) * (r.bottom - r.top);
     if (area > ctx->best_area) { ctx->best_area = area; ctx->found = hwnd; }
     return TRUE;
 }
 
-static HWND find_vlc_video_panel(void) {
-    /* Find VLC's Qt main window then drill to video widget */
-    HWND vlc_main = FindWindowW(L"Qt5QWindowIcon", NULL);
-    if (!vlc_main) vlc_main = FindWindowW(L"QWidget", NULL);
-    if (!vlc_main) return NULL;
-    find_video_t ctx = { NULL, 10000 };
-    EnumChildWindows(vlc_main, find_video_child, (LPARAM)&ctx);
-    if (ctx.found) {
-        find_video_t ctx2 = { NULL, 10000 };
-        EnumChildWindows(ctx.found, find_video_child, (LPARAM)&ctx2);
-        if (ctx2.found) return ctx2.found;
-        return ctx.found;
+/* Find VLC's main window by walking all top-level windows owned by our process */
+static BOOL CALLBACK find_vlc_main(HWND hwnd, LPARAM lp) {
+    find_video_t *ctx = (find_video_t *)lp;
+    DWORD wnd_pid;
+    GetWindowThreadProcessId(hwnd, &wnd_pid);
+    if (wnd_pid != ctx->pid) return TRUE;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    /* Skip our own AuraViz windows */
+    wchar_t cls[64];
+    GetClassNameW(hwnd, cls, 64);
+    if (wcscmp(cls, L"AuraVizClass") == 0) return TRUE;
+    RECT r;
+    GetClientRect(hwnd, &r);
+    int area = (r.right - r.left) * (r.bottom - r.top);
+    if (area > ctx->best_area) { ctx->best_area = area; ctx->found = hwnd; }
+    return TRUE;
+}
+
+static HWND find_vlc_video_panel(vlc_object_t *obj) {
+    DWORD pid = GetCurrentProcessId();
+
+    /* Find the largest top-level window in our process (VLC main window) */
+    find_video_t ctx = { NULL, 20000, pid };
+    EnumWindows(find_vlc_main, (LPARAM)&ctx);
+    if (!ctx.found) {
+        msg_Dbg(obj, "AuraViz: no VLC main window found for PID %lu", (unsigned long)pid);
+        return NULL;
     }
-    return NULL;
+    HWND vlc_main = ctx.found;
+    msg_Dbg(obj, "AuraViz: found VLC main window %p", (void*)vlc_main);
+
+    /* Find the largest child (likely the central video widget area) */
+    find_video_t ctx2 = { NULL, 5000, pid };
+    EnumChildWindows(vlc_main, find_biggest_child, (LPARAM)&ctx2);
+    if (!ctx2.found) {
+        msg_Dbg(obj, "AuraViz: no suitable child found, using main window");
+        return vlc_main;
+    }
+
+    /* Drill one more level — the actual video surface may be a grandchild */
+    find_video_t ctx3 = { NULL, 5000, pid };
+    EnumChildWindows(ctx2.found, find_biggest_child, (LPARAM)&ctx3);
+    if (ctx3.found) {
+        msg_Dbg(obj, "AuraViz: found video grandchild %p (%dx%d)",
+                (void*)ctx3.found, ctx3.best_area, 0);
+        return ctx3.found;
+    }
+
+    msg_Dbg(obj, "AuraViz: using child %p", (void*)ctx2.found);
+    return ctx2.found;
 }
 
 /* ══ Win32 Window ══ */
@@ -754,42 +791,73 @@ static void create_window(auraviz_thread_t *p) {
     wc.lpszClassName = WNDCLASS_NAME;
     RegisterClassExW(&wc);
 
-    HWND vlc_panel = find_vlc_video_panel();
+    /* Try to embed — retry a few times since VLC's window may still be setting up */
+    HWND vlc_panel = NULL;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        vlc_panel = find_vlc_video_panel(p->p_obj);
+        if (vlc_panel) break;
+        if (attempt < 4) Sleep(200);  /* wait 200ms between attempts */
+    }
+
     if (vlc_panel) {
-        RECT pr; GetClientRect(vlc_panel, &pr);
-        int pw = pr.right-pr.left, ph = pr.bottom-pr.top;
-        if (pw < 100) pw = p->i_width; if (ph < 100) ph = p->i_height;
+        RECT pr;
+        GetClientRect(vlc_panel, &pr);
+        int pw = pr.right - pr.left, ph = pr.bottom - pr.top;
+        if (pw < 100) pw = p->i_width;
+        if (ph < 100) ph = p->i_height;
         p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz",
-                                  WS_CHILD|WS_VISIBLE, 0, 0, pw, ph,
+                                  WS_CHILD | WS_VISIBLE,
+                                  0, 0, pw, ph,
                                   vlc_panel, NULL, GetModuleHandle(NULL), NULL);
         if (p->hwnd) {
-            p->vlc_parent = vlc_panel; p->embedded = true;
-            p->i_width = pw; p->i_height = ph;
+            p->vlc_parent = vlc_panel;
+            p->embedded = true;
+            p->i_width = pw;
+            p->i_height = ph;
             msg_Info(p->p_obj, "AuraViz: embedded in VLC video panel (%dx%d)", pw, ph);
             return;
         }
+        msg_Warn(p->p_obj, "AuraViz: CreateWindow as child failed (err=%lu), falling back",
+                 GetLastError());
     }
-    msg_Info(p->p_obj, "AuraViz: standalone window (VLC panel not found)");
-    DWORD style = WS_OVERLAPPEDWINDOW|WS_VISIBLE;
-    RECT r = {0, 0, p->i_width, p->i_height}; AdjustWindowRect(&r, style, FALSE);
-    p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz", style,
-                              CW_USEDEFAULT, CW_USEDEFAULT, r.right-r.left, r.bottom-r.top,
+
+    /* Fallback: standalone borderless dark window, always on top initially */
+    msg_Info(p->p_obj, "AuraViz: standalone window mode");
+    DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+    RECT r = {0, 0, p->i_width, p->i_height};
+    AdjustWindowRect(&r, style, FALSE);
+    p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz GL", style,
+                              CW_USEDEFAULT, CW_USEDEFAULT,
+                              r.right - r.left, r.bottom - r.top,
                               NULL, NULL, GetModuleHandle(NULL), NULL);
-    p->vlc_parent = NULL; p->embedded = false;
+    p->vlc_parent = NULL;
+    p->embedded = false;
 }
 
 static int init_gl_context(auraviz_thread_t *p) {
-    create_window(p); if (!p->hwnd) return -1;
+    create_window(p);
+    if (!p->hwnd) {
+        msg_Err(p->p_obj, "AuraViz: window creation failed completely");
+        return -1;
+    }
     p->hdc = GetDC(p->hwnd);
     PIXELFORMATDESCRIPTOR pfd = {0};
     pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
     pfd.dwFlags = PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER;
     pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32; pfd.iLayerType = PFD_MAIN_PLANE;
-    int fmt = ChoosePixelFormat(p->hdc, &pfd); if (!fmt) return -1;
+    int fmt = ChoosePixelFormat(p->hdc, &pfd);
+    if (!fmt) { msg_Err(p->p_obj, "AuraViz: ChoosePixelFormat failed"); return -1; }
     SetPixelFormat(p->hdc, fmt, &pfd);
-    p->hglrc = wglCreateContext(p->hdc); if (!p->hglrc) return -1;
+    p->hglrc = wglCreateContext(p->hdc);
+    if (!p->hglrc) { msg_Err(p->p_obj, "AuraViz: wglCreateContext failed (err=%lu)", GetLastError()); return -1; }
     wglMakeCurrent(p->hdc, p->hglrc);
-    if (load_gl_functions() < 0) { msg_Err(p->p_obj, "Failed to load GL functions"); return -1; }
+
+    /* Log GL version for diagnostics */
+    const char *gl_ver = (const char *)glGetString(GL_VERSION);
+    const char *gl_ren = (const char *)glGetString(GL_RENDERER);
+    msg_Info(p->p_obj, "AuraViz GL: %s on %s", gl_ver ? gl_ver : "?", gl_ren ? gl_ren : "?");
+
+    if (load_gl_functions() < 0) { msg_Err(p->p_obj, "AuraViz: failed to load GLSL functions — GPU may not support OpenGL 2.0+"); return -1; }
     return 0;
 }
 
