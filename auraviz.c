@@ -45,7 +45,7 @@
 #define VOUT_HEIGHT  500
 #define NUM_BANDS    64
 #define MAX_BLOCKS   100
-#define NUM_PRESETS  33
+#define NUM_PRESETS  35
 #define FFT_N        1024
 #define RING_SIZE    4096
 
@@ -60,7 +60,7 @@ vlc_module_begin ()
     set_capability( "visualization", 0 )
     add_integer( "auraviz-width",  VOUT_WIDTH,  "Video width", "Width of visualization window", false )
     add_integer( "auraviz-height", VOUT_HEIGHT, "Video height", "Height of visualization window", false )
-    add_integer( "auraviz-preset", 0, "Preset", "0=auto-cycle, 1-33=specific", false )
+    add_integer( "auraviz-preset", 0, "Preset", "0=auto-cycle, 1-35=specific", false )
     add_integer( "auraviz-gain", 50, "Gain", "Sensitivity 0-100", false )
         change_integer_range( 0, 100 )
     add_integer( "auraviz-smooth", 50, "Smoothing", "0-100", false )
@@ -246,17 +246,23 @@ static GLuint build_program(const char *body, vlc_object_t *obj) {
 static const char *frag_spectrum =
     "void main() {\n"
     "    vec2 uv = gl_FragCoord.xy / u_resolution;\n"
-    "    float band = spec(uv.x);\n"
-    "    float bar = smoothstep(band, band + 0.02, uv.y);\n"
-    "    vec3 col = hsv2rgb(vec3(uv.x*0.8, 0.85, 1.0-bar)) * (1.0+u_beat*0.3);\n"
-    "    gl_FragColor = vec4(col, 1.0);\n}\n";
+    "    float band = spec(uv.x) * (1.0 + u_bass*0.5 + u_beat*0.8);\n"
+    "    float yc = abs(uv.y - 0.5) * 2.0;\n"
+    "    float bar = smoothstep(band*1.2, band*1.2 + 0.02, yc);\n"
+    "    float glow = 0.01 / (abs(yc - band*1.2) + 0.01) * 0.3;\n"
+    "    vec3 col = hsv2rgb(vec3(uv.x*0.8+u_time*0.05, 0.85, 1.0)) * (1.0-bar+glow) * (1.0+u_beat*0.5);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_wave =
     "void main() {\n"
     "    vec2 uv = gl_FragCoord.xy / u_resolution;\n"
-    "    float wave = 0.5 + (spec(uv.x)-0.5) * (1.0+u_bass);\n"
-    "    float glow = 0.005 / (abs(uv.y-wave)+0.005);\n"
-    "    vec3 col = hsv2rgb(vec3(mod(uv.x+u_time*0.1,1.0), 0.8, 1.0)) * glow;\n"
+    "    float s = spec(uv.x) * (1.5 + u_bass*2.0 + u_beat*1.5);\n"
+    "    float wave1 = 0.5 + s * sin(uv.x*12.0 + u_time*3.0 + u_bass*4.0) * 0.3;\n"
+    "    float wave2 = 0.5 - s * sin(uv.x*12.0 + u_time*3.0 + u_bass*4.0) * 0.3;\n"
+    "    float g1 = 0.004 / (abs(uv.y-wave1)+0.004);\n"
+    "    float g2 = 0.004 / (abs(uv.y-wave2)+0.004);\n"
+    "    float fill = smoothstep(0.0, 0.02, s*0.3 - abs(uv.y-0.5)) * 0.3;\n"
+    "    vec3 col = hsv2rgb(vec3(mod(uv.x*0.5+u_time*0.15,1.0), 0.8, 1.0)) * (g1+g2+fill);\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_circular =
@@ -270,14 +276,21 @@ static const char *frag_circular =
 
 static const char *frag_particles =
     "void main() {\n"
-    "    vec2 uv = gl_FragCoord.xy / u_resolution; float aspect = u_resolution.x/u_resolution.y; vec3 col = vec3(0.0);\n"
-    "    for(int i=0;i<60;i++){\n"
-    "        float fi=float(i); vec2 p=vec2(hash(vec2(fi,0.0)),hash(vec2(0.0,fi)));\n"
-    "        p=fract(p+u_time*vec2(0.02+fi*0.003,0.03-fi*0.002));\n"
-    "        vec2 diff=uv-p; diff.x*=aspect; float d=length(diff);\n"
-    "        float bval=spec(mod(fi*3.0,64.0)/64.0);\n"
-    "        col+=hsv2rgb(vec3(mod(fi/60.0+u_time*0.05,1.0),0.7,1.0))*0.003*(0.5+bval)/(d+0.003);\n"
+    "    vec2 uv = (gl_FragCoord.xy/u_resolution-0.5)*2.0; uv.x *= u_resolution.x/u_resolution.y;\n"
+    "    vec3 col = vec3(0.0); float t = u_time;\n"
+    "    for(int i=0;i<120;i++){\n"
+    "        float fi=float(i);\n"
+    "        float z = fract(hash(vec2(fi*0.73,fi*1.17)) + t*0.15*(0.5+hash(vec2(fi*3.1,0.0))));\n"
+    "        float depth = 1.0/(z*3.0+0.1);\n"
+    "        vec2 p = vec2(hash(vec2(fi,1.0))-0.5, hash(vec2(1.0,fi))-0.5) * depth;\n"
+    "        vec2 diff = uv - p;\n"
+    "        float d = length(diff);\n"
+    "        float bval = spec(mod(fi*2.0,64.0)/64.0);\n"
+    "        float sz = (0.008+bval*0.015)*depth*(1.0+u_beat*0.5);\n"
+    "        float glow = sz/(d*d+sz*0.1);\n"
+    "        col += hsv2rgb(vec3(mod(fi/120.0+t*0.02,1.0),0.3+z*0.5,1.0)) * glow * 0.15;\n"
     "    }\n"
+    "    col += vec3(0.8,0.85,1.0)*0.02/(length(uv)+0.05)*u_energy;\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_nebula =
@@ -497,19 +510,24 @@ static const char *frag_stormvortex =
 
 static const char *frag_plasmaaurora =
     "void main() {\n"
-    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time*0.4;\n"
-    "    float v=(sin(uv.x*10.0+t+u_bass*5.0)+sin(uv.y*10.0+t*0.5)+sin(length(uv-0.5)*12.0+t)+sin(length(uv-vec2(0.8,0.3))*8.0))*0.25;\n"
-    "    float curtain=0.0;\n"
-    "    for(int l=0;l<3;l++){float fl=float(l);\n"
-    "        float wave=sin(uv.x*6.0+t*(1.0+fl*0.3)+u_bass*3.0)*0.5+sin(uv.x*15.0+t*1.5+fl)*0.3;\n"
-    "        curtain+=exp(-pow(uv.y-(0.7-wave*0.12-fl*0.05),2.0)*60.0)*(0.5+v*0.5);}\n"
-    "    vec3 plasma=vec3(sin(v*3.14159+u_energy*2.0)*0.5+0.5,sin(v*3.14159+2.094+u_bass*3.0)*0.5+0.5,sin(v*3.14159+4.188+u_treble*2.0)*0.5+0.5);\n"
-    "    vec3 aurora=hsv2rgb(vec3(mod(0.278+curtain*0.222+uv.x*0.083+t*0.028,1.0),0.8,clamp(curtain,0.0,1.0)));\n"
-    "    gl_FragColor = vec4(clamp(mix(plasma*0.4,aurora,clamp(curtain*1.5,0.0,1.0))+u_beat*0.08,0.0,1.0),1.0);\n}\n";
+    "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time;\n"
+    "    float beam_y = 0.5 + sin(uv.x*8.0+t*4.0+u_bass*6.0)*0.15*(1.0+u_treble*2.0)\n"
+    "        + sin(uv.x*20.0+t*8.0)*0.05*u_treble\n"
+    "        + sin(uv.x*3.0+t*2.0)*0.08*u_mid + u_beat*sin(t*12.0)*0.06;\n"
+    "    float dist = abs(uv.y - beam_y);\n"
+    "    float core = 0.003/(dist+0.003);\n"
+    "    float inner = 0.015/(dist+0.015)*0.5;\n"
+    "    float outer = 0.06/(dist+0.06)*0.2;\n"
+    "    float beam = core + inner + outer;\n"
+    "    float hue = mod(uv.x*0.5 + t*0.3 + u_bass*0.5, 1.0);\n"
+    "    vec3 col = hsv2rgb(vec3(hue, 0.7+u_beat*0.3, 1.0)) * beam * (1.0+u_energy+u_beat*0.5);\n"
+    "    col += vec3(1.0,0.8,1.0) * core * 0.5;\n"
+    "    col += hsv2rgb(vec3(mod(hue+0.3,1.0),0.5,1.0)) * noise(vec2(uv.x*30.0,t*10.0)) * 0.1 / (dist+0.03);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_fractalfire =
     "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.5*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*1.6*vec2(u_resolution.x/u_resolution.y,1.0);\n"
     "    vec2 c=vec2(-0.75+sin(u_time*0.2)*0.1,0.15+cos(u_time*0.15)*0.1+u_bass*0.08);\n"
     "    vec2 z=uv; float iter=0.0;\n"
     "    for(int i=0;i<48;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c;if(dot(z,z)>4.0)break;iter+=1.0;}\n"
@@ -518,48 +536,74 @@ static const char *frag_fractalfire =
     "    else if(flame<0.5){float g=(flame-0.25)*4.0;col=vec3(0.7+g*0.3,g*0.5,0);}\n"
     "    else if(flame<0.75){float g=(flame-0.5)*4.0;col=vec3(1,0.5+g*0.5,g*0.2);}\n"
     "    else{float g=(flame-0.75)*4.0;col=vec3(1,1,0.2+g*0.8);}\n"
-    "    if(f>=1.0) col=vec3(0.01,0,0.02);\n"
+    "    if(f>=1.0) col=vec3(0.08+u_bass*0.1,0.02,0.04+u_energy*0.05);\n"
     "    gl_FragColor = vec4(col, 1.0);\n}\n";
 
 static const char *frag_fireballs =
     "void main() {\n"
     "    vec2 uv=gl_FragCoord.xy/u_resolution; float aspect=u_resolution.x/u_resolution.y,t=u_time;\n"
     "    vec3 col=vec3(0.01,0.005,0.02);\n"
-    "    for(int i=0;i<40;i++){float fi=float(i),phase=fi*0.618+fi*fi*0.01;\n"
-    "        float bx=0.5+sin(phase+t*(0.5+fi*0.03))*(0.35+fi*0.003);\n"
-    "        float by=0.15+abs(sin(mod(t*(0.8+fi*0.05)+phase,3.14159)))*(0.5+u_bass*0.3+u_beat*0.15);\n"
-    "        float dx=(uv.x-bx)*aspect,dy=uv.y-by,d=dx*dx+dy*dy;\n"
-    "        float sz=0.001+u_energy*0.0005+u_beat*0.0008;\n"
-    "        float brightness=sz/(d+0.0001)*(0.5+spec(mod(fi*3.0,64.0)/64.0));\n"
-    "        vec3 c=vec3(1,0.3+fi*0.01,0.05);\n"
-    "        if(mod(fi,3.0)<1.0)c=vec3(0.2,0.5,1);else if(mod(fi,3.0)<2.0)c=vec3(0.1,1,0.3);\n"
-    "        col+=c*brightness;}\n"
+    "    for(int i=0;i<50;i++){float fi=float(i),phase=hash(vec2(fi*1.23,fi*0.77))*6.283;\n"
+    "        float speed=0.6+hash(vec2(fi*3.1,0.0))*1.2;\n"
+    "        float bx=fract(hash(vec2(fi,1.0))+t*speed*0.08);\n"
+    "        float bounce=abs(fract(t*speed*0.3+phase*0.5)*2.0-1.0);\n"
+    "        float by=0.05+bounce*0.9;\n"
+    "        vec2 diff=vec2((uv.x-bx)*aspect, uv.y-by);\n"
+    "        float d=dot(diff,diff);\n"
+    "        float bval=spec(mod(fi*2.0,64.0)/64.0);\n"
+    "        float sz=0.0015+u_energy*0.001+u_beat*0.001+bval*0.001;\n"
+    "        float brightness=sz/(d+0.00005)*(0.4+bval*0.6);\n"
+    "        float hue=mod(fi*0.031+t*0.05,1.0);\n"
+    "        col+=hsv2rgb(vec3(hue,0.8,1.0))*brightness;}\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_shockwave =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float dist=length(uv),t=u_time; vec3 col=vec3(0.01,0.005,0.02);\n"
-    "    for(int ring=0;ring<12;ring++){float fr=float(ring);\n"
-    "        float birth=fr*0.5+floor(t/0.5)*0.5-mod(fr,3.0)*0.17, age=t-birth;\n"
-    "        if(age<0.0||age>2.5) continue;\n"
-    "        float radius=age*(1.0+u_bass*0.8+u_beat*0.5), thick=0.03+age*0.01, rd=abs(dist-radius);\n"
-    "        col+=hsv2rgb(vec3(mod(fr*0.08+age*0.2+t*0.05,1.0),0.8,1.0))*(1.0-age/2.5)*exp(-rd*rd/(thick*thick))*(0.5+u_energy);}\n"
-    "    col+=u_beat*0.3*exp(-dist*dist*8.0)*vec3(1,0.8,0.5);\n"
+    "    float dist=length(uv),t=u_time; vec3 col=vec3(0.02,0.01,0.04);\n"
+    "    float hue_base=mod(t*0.05,1.0);\n"
+    "    for(int ring=0;ring<20;ring++){float fr=float(ring);\n"
+    "        float birth=fr*0.3+floor(t/0.3)*0.3-mod(fr,4.0)*0.08, age=t-birth;\n"
+    "        if(age<0.0||age>4.0) continue;\n"
+    "        float radius=age*(0.8+u_bass*0.6+u_beat*0.4);\n"
+    "        float thick=0.04+age*0.015; float rd=abs(dist-radius);\n"
+    "        float fade=1.0-age/4.0;\n"
+    "        col+=hsv2rgb(vec3(hue_base,0.8,1.0))*fade*exp(-rd*rd/(thick*thick))*(0.5+u_energy);}\n"
+    "    float core_r=0.25+u_bass*0.15+u_beat*0.1;\n"
+    "    float core=smoothstep(core_r+0.05,core_r-0.05,dist);\n"
+    "    float elec_wave=sin(uv.x*30.0+t*8.0+u_treble*10.0)*0.5+0.5;\n"
+    "    elec_wave*=exp(-uv.y*uv.y*20.0);\n"
+    "    float elec_w=core_r*1.3+0.1;\n"
+    "    float horiz=smoothstep(elec_w,elec_w-0.05,abs(uv.x))*exp(-uv.y*uv.y*15.0);\n"
+    "    vec3 core_col=hsv2rgb(vec3(mod(hue_base+0.5,1.0),0.6,1.0))*core*(0.8+u_energy);\n"
+    "    core_col+=vec3(0.8,0.9,1.0)*elec_wave*core*0.5;\n"
+    "    core_col+=vec3(0.6,0.7,1.0)*horiz*0.3*(1.0+u_beat);\n"
+    "    col+=core_col;\n"
+    "    col+=vec3(0.05,0.03,0.08)*(1.0-dist*0.5);\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_dna =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float t=u_time*0.8; vec3 col=vec3(0.01,0.005,0.03);\n"
-    "    float scroll=uv.y*8.0+t*2.0, s1x=sin(scroll)*0.3, s2x=sin(scroll+3.14159)*0.3;\n"
-    "    col+=vec3(0.2,0.6,1)*0.006/(length(vec2(uv.x-s1x,0))+0.003)*(0.5+u_energy);\n"
-    "    col+=vec3(1,0.3,0.5)*0.006/(length(vec2(uv.x-s2x,0))+0.003)*(0.5+u_energy);\n"
-    "    float rp=mod(scroll,1.0);\n"
-    "    if(rp<0.15){float ry=floor(scroll),bv=spec(mod(abs(ry),64.0)/64.0);\n"
-    "        float rx1=sin(ry+t*2.0)*0.3,rx2=sin(ry+t*2.0+3.14159)*0.3;\n"
-    "        if(uv.x>min(rx1,rx2)&&uv.x<max(rx1,rx2))\n"
-    "            col+=hsv2rgb(vec3(mod(ry*0.05+t*0.1,1.0),0.7,1.0))*(1.0-abs(rp-0.075)/0.075)*bv*(0.5+u_beat*0.5)*0.8;}\n"
+    "    float t=u_time; vec3 col=vec3(0.01,0.005,0.02);\n"
+    "    float speed=1.5+u_energy*2.0+u_beat;\n"
+    "    for(int strand=0;strand<4;strand++){\n"
+    "        float fs=float(strand), offset=fs*1.5708+t*0.3*fs;\n"
+    "        float cx=sin(t*0.4+fs*2.0)*0.3, cy=cos(t*0.3+fs*1.5)*0.2;\n"
+    "        for(int helix=0;helix<2;helix++){\n"
+    "            float ph=float(helix)*3.14159;\n"
+    "            float scroll=uv.y*5.0+t*speed+offset;\n"
+    "            float sx=cx+sin(scroll+ph)*0.25*(1.0+u_bass*0.3);\n"
+    "            float sz=cos(scroll+ph)*0.5+0.5;\n"
+    "            float thick=0.015+sz*0.01;\n"
+    "            float dx=abs(uv.x-sx);\n"
+    "            float glow=thick/(dx*dx+thick)*sz;\n"
+    "            float hue=mod(fs*0.25+t*0.1+u_beat*0.2,1.0);\n"
+    "            col+=hsv2rgb(vec3(hue,0.8,1.0))*glow*0.4*(0.5+u_energy);\n"
+    "            float elec=noise(vec2(uv.y*40.0+fs*10.0,t*8.0))*0.02/(dx+0.01)*sz;\n"
+    "            col+=vec3(0.7,0.8,1.0)*elec*u_energy;\n"
+    "        }\n"
+    "    }\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_lightningweb =
@@ -581,20 +625,77 @@ static const char *frag_lightningweb =
 static const char *frag_constellation =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float t=u_time*0.3; vec3 col=vec3(0.005,0.005,0.02);\n"
-    "    vec2 stars[20];\n"
-    "    for(int i=0;i<20;i++){float fi=float(i);stars[i]=vec2(sin(fi*3.7+t*0.2+sin(t*0.1+fi))*0.8,cos(fi*2.3+t*0.15+cos(t*0.12+fi*0.7))*0.8);}\n"
-    "    for(int i=0;i<20;i++) for(int j=i+1;j<20;j++){\n"
-    "        float ld=length(stars[i]-stars[j]); if(ld>0.6) continue;\n"
-    "        float bri=spec(mod(float(i+j*3),64.0)/64.0)*(1.0-ld/0.6); if(bri<0.05) continue;\n"
-    "        vec2 a=stars[i],b=stars[j],ab=b-a; float abl=length(ab); vec2 abd=ab/(abl+0.001);\n"
-    "        float proj=clamp(dot(uv-a,abd),0.0,abl); vec2 cl=a+abd*proj;\n"
-    "        col+=hsv2rgb(vec3(mod(0.55+float(i)*0.02,1.0),0.4,1.0))*0.001/(length(uv-cl)+0.001)*bri*0.5;}\n"
-    "    for(int i=0;i<20;i++){float d=length(uv-stars[i]),pulse=0.5+spec(float(i)/20.0)*0.5+u_beat*0.2;\n"
-    "        col+=vec3(0.9,0.95,1)*0.003/(d+0.002)*pulse*(sin(float(i)*7.0+t*3.0)*0.3+0.7);}\n"
-    "    col+=vec3(0.02,0.015,0.04)*noise(uv*5.0+t*0.1);\n"
+    "    float t=u_time*1.5; vec3 col=vec3(0.005,0.005,0.02);\n"
+    "    for(int i=0;i<50;i++){\n"
+    "        float fi=float(i);\n"
+    "        vec2 star=vec2(sin(fi*3.7+t*0.3+sin(t*0.15+fi))*1.2, cos(fi*2.3+t*0.25+cos(t*0.18+fi*0.7))*0.9);\n"
+    "        float d=length(uv-star);\n"
+    "        float pulse=0.5+spec(mod(fi*3.0,64.0)/64.0)+u_beat*0.5;\n"
+    "        float twinkle=sin(fi*7.0+t*4.0)*0.4+0.6;\n"
+    "        col+=vec3(0.9,0.95,1)*0.012/(d+0.004)*pulse*twinkle;\n"
+    "        for(int j=i+1;j<50;j++){if(j>i+8)break;\n"
+    "            float fj=float(j);\n"
+    "            vec2 s2=vec2(sin(fj*3.7+t*0.3+sin(t*0.15+fj))*1.2,cos(fj*2.3+t*0.25+cos(t*0.18+fj*0.7))*0.9);\n"
+    "            float ld=length(star-s2); if(ld>0.5) continue;\n"
+    "            float bri=spec(mod(float(i+j*3),64.0)/64.0)*(1.0-ld/0.5); if(bri<0.1) continue;\n"
+    "            vec2 ab=s2-star; float abl=length(ab); vec2 abd=ab/(abl+0.001);\n"
+    "            float proj=clamp(dot(uv-star,abd),0.0,abl); vec2 cl=star+abd*proj;\n"
+    "            float jag=noise(vec2(proj*25.0+fi*5.0,t*8.0))*0.03*(1.0+u_beat);\n"
+    "            float ld2=max(length(uv-cl)-jag,0.0);\n"
+    "            col+=hsv2rgb(vec3(mod(0.55+fi*0.02+t*0.05,1.0),0.5,1.0))*0.002/(ld2+0.002)*bri;\n"
+    "        }\n"
+    "    }\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
+
+static const char *frag_lightningweb2 =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float t=u_time;\n"
+    "    float zoom=1.0+sin(t*0.8+u_beat*2.0)*0.3;\n"
+    "    vec2 guv=uv*zoom*3.0;\n"
+    "    float gw=0.8+sin(t*0.5)*0.4;\n"
+    "    float gh=0.8+cos(t*0.6)*0.4;\n"
+    "    float gx=abs(fract(guv.x/gw)-0.5)*2.0;\n"
+    "    float gy=abs(fract(guv.y/gh)-0.5)*2.0;\n"
+    "    float grid_h=smoothstep(0.02,0.0,abs(gy-0.5)*gw)*0.3;\n"
+    "    float grid_v=smoothstep(0.02,0.0,abs(gx-0.5)*gh)*0.3;\n"
+    "    float hue1=mod(t*0.15,1.0), hue2=mod(t*0.15+0.33,1.0);\n"
+    "    vec3 bg=hsv2rgb(vec3(hue1,0.6,0.15+grid_h*0.4))+hsv2rgb(vec3(hue2,0.6,grid_v*0.4));\n"
+    "    vec3 col=bg;\n"
+    "    vec2 nodes[8];\n"
+    "    for(int i=0;i<8;i++){float fi=float(i);nodes[i]=vec2(sin(fi*2.4+t*0.5+fi)*0.7,cos(fi*1.7+t*0.4+fi*fi*0.3)*0.7);}\n"
+    "    for(int i=0;i<8;i++) for(int j=i+1;j<8;j++){\n"
+    "        float le=spec(float(i*8+j)/64.0); if(le<0.15) continue;\n"
+    "        vec2 a=nodes[i],b=nodes[j],ab=b-a; float abl=length(ab); vec2 abd=ab/(abl+0.001);\n"
+    "        float proj=clamp(dot(uv-a,abd),0.0,abl); vec2 cl=a+abd*proj;\n"
+    "        float jag=noise(vec2(proj*20.0+float(i+j)*5.0,t*5.0))*0.04*(1.0+u_beat);\n"
+    "        vec2 perp=vec2(-abd.y,abd.x); float d=max(abs(dot(uv-cl,perp))-jag,0.0);\n"
+    "        col+=hsv2rgb(vec3(mod(0.6+float(i)*0.05+t*0.03,1.0),0.5,1.0))*0.003/(d+0.002)*le*(0.5+u_energy+u_beat*0.5);}\n"
+    "    for(int i=0;i<8;i++) col+=vec3(0.8,0.9,1)*0.008/(length(uv-nodes[i])+0.005)*(0.5+u_energy);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+static const char *frag_helixparticles =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float t=u_time; vec3 col=vec3(0.01,0.005,0.02);\n"
+    "    for(int i=0;i<80;i++){\n"
+    "        float fi=float(i), phase=hash(vec2(fi*0.73,fi*1.31))*6.283;\n"
+    "        float orbit_r=0.2+hash(vec2(fi*2.1,fi*0.5))*0.7;\n"
+    "        float speed=1.0+hash(vec2(fi*1.7,0.0))*3.0;\n"
+    "        float vert=sin(t*speed*0.3+phase)*0.8;\n"
+    "        float helix_angle=t*speed+phase+fi*0.5;\n"
+    "        float px=orbit_r*cos(helix_angle)+sin(t*0.5+fi)*0.1;\n"
+    "        float py=vert+orbit_r*sin(helix_angle)*0.3;\n"
+    "        vec2 diff=uv-vec2(px,py);\n"
+    "        float d=length(diff);\n"
+    "        float bval=spec(mod(fi*2.5,64.0)/64.0);\n"
+    "        float sz=0.008+bval*0.01+u_beat*0.005;\n"
+    "        float glow=sz/(d*d+sz*0.05);\n"
+    "        float hue=mod(fi*0.013+t*0.08+vert*0.2,1.0);\n"
+    "        col+=hsv2rgb(vec3(hue,0.7,1.0))*glow*0.12*(0.5+u_energy);\n"
+    "    }\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 static const char *get_frag_body(int preset) {
     switch(preset) {
         case 0:return frag_spectrum;case 1:return frag_wave;case 2:return frag_circular;
@@ -608,11 +709,18 @@ static const char *get_frag_body(int preset) {
         case 24:return frag_galaxyripple;case 25:return frag_stormvortex;case 26:return frag_plasmaaurora;
         case 27:return frag_fractalfire;case 28:return frag_fireballs;case 29:return frag_shockwave;
         case 30:return frag_dna;case 31:return frag_lightningweb;case 32:return frag_constellation;
+        case 33:return frag_lightningweb2;case 34:return frag_helixparticles;
         default:return frag_spectrum;
     }
 }
 
 /* == Standalone Win32 GL Window == */
+/* Persistent window singleton — survives VLC Close/Open between songs */
+static HWND g_persistent_hwnd = NULL;
+static HDC  g_persistent_hdc = NULL;
+static HGLRC g_persistent_hglrc = NULL;
+static int g_persistent_w = 0, g_persistent_h = 0;
+static bool g_wndclass_registered = false;
 static const wchar_t WNDCLASS_NAME[] = L"AuraVizClass";
 static volatile int g_resize_w = 0, g_resize_h = 0;
 static volatile bool g_resized = false;
@@ -652,13 +760,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static int init_gl_context(auraviz_thread_t *p) {
-    WNDCLASSEXW wc = {0};
-    wc.cbSize = sizeof(wc); wc.style = CS_OWNDC|CS_DBLCLKS;
-    wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(NULL);
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = WNDCLASS_NAME;
-    RegisterClassExW(&wc);
+    /* Reuse persistent window if it exists (song change, not first launch) */
+    if (g_persistent_hwnd && IsWindow(g_persistent_hwnd)) {
+        p->hwnd = g_persistent_hwnd;
+        p->hdc = g_persistent_hdc;
+        p->hglrc = g_persistent_hglrc;
+        wglMakeCurrent(p->hdc, p->hglrc);
+        ShowWindow(p->hwnd, SW_SHOW);
+        RECT cr; GetClientRect(p->hwnd, &cr);
+        p->i_width = cr.right - cr.left;
+        p->i_height = cr.bottom - cr.top;
+        msg_Info(p->p_obj, "AuraViz: reusing window (%dx%d)", p->i_width, p->i_height);
+        if (load_gl_functions() < 0) return -1;
+        return 0;
+    }
+    if (!g_wndclass_registered) {
+        WNDCLASSEXW wc = {0};
+        wc.cbSize = sizeof(wc); wc.style = CS_OWNDC|CS_DBLCLKS;
+        wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName = WNDCLASS_NAME;
+        RegisterClassExW(&wc);
+        g_wndclass_registered = true;
+    }
     DWORD style = WS_OVERLAPPEDWINDOW|WS_VISIBLE;
     RECT r = {0, 0, p->i_width, p->i_height}; AdjustWindowRect(&r, style, FALSE);
     p->hwnd = CreateWindowExW(0, WNDCLASS_NAME, L"AuraViz", style,
@@ -677,13 +802,17 @@ static int init_gl_context(auraviz_thread_t *p) {
     const char *gl_ver = (const char *)glGetString(GL_VERSION);
     const char *gl_ren = (const char *)glGetString(GL_RENDERER);
     msg_Info(p->p_obj, "AuraViz GL: %s on %s", gl_ver ? gl_ver : "?", gl_ren ? gl_ren : "?");
+    /* Store as persistent */
+    g_persistent_hwnd = p->hwnd;
+    g_persistent_hdc = p->hdc;
+    g_persistent_hglrc = p->hglrc;
     if (load_gl_functions() < 0) { msg_Err(p->p_obj, "AuraViz: need OpenGL 2.0+"); return -1; }
     return 0;
 }
 
 static void cleanup_gl(auraviz_thread_t *p) {
-    if (p->hglrc) { wglMakeCurrent(NULL, NULL); wglDeleteContext(p->hglrc); }
-    if (p->hwnd) { ReleaseDC(p->hwnd, p->hdc); DestroyWindow(p->hwnd); }
+    /* Don't destroy — keep window persistent across songs */
+    if (p->hglrc) wglMakeCurrent(NULL, NULL);
 }
 
 /* == Render Thread == */
