@@ -151,41 +151,69 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
                           int nb_samples, int channels)
 {
     if (nb_samples < 2 || channels < 1) return;
-    int spb = nb_samples / NUM_BANDS;
-    if (spb < 1) spb = 1;
+
+    /* Mix to mono, cap at 1024 for performance */
+    int N = nb_samples;
+    if (N > 1024) N = 1024;
+    float mono[1024];
+    for (int i = 0; i < N; i++) {
+        float s = 0;
+        for (int c = 0; c < channels; c++) s += samples[i * channels + c];
+        mono[i] = s / channels;
+    }
+
+    /* Apply Hann window */
+    for (int i = 0; i < N; i++) {
+        float w = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (N - 1)));
+        mono[i] *= w;
+    }
+
+    /* Compute DFT magnitude for log-spaced frequency bins.
+       One DFT bin per band at the center frequency. */
     for (int band = 0; band < NUM_BANDS; band++) {
-        float sum = 0;
-        int start = band * spb, end = start + spb;
-        if (end > nb_samples) end = nb_samples;
-        for (int i = start; i < end; i++) {
-            float mono = 0;
-            for (int c = 0; c < channels; c++) mono += samples[i * channels + c];
-            mono /= channels;
-            sum += mono * mono;
+        /* Log-spaced: band 0 ~ 30Hz, band 63 ~ 15kHz */
+        float freq = 30.0f * powf(500.0f, (float)band / (NUM_BANDS - 1));
+        int k = (int)(freq * N / 44100.0f + 0.5f);
+        if (k < 1) k = 1;
+        if (k >= N/2) k = N/2 - 1;
+
+        float re = 0, im = 0;
+        float angle_step = 2.0f * (float)M_PI * k / N;
+        for (int n = 0; n < N; n++) {
+            float a = angle_step * n;
+            re += mono[n] * cosf(a);
+            im -= mono[n] * sinf(a);
         }
-        float rms = sqrtf(sum / (end - start + 1));
-        p->bands[band] = rms;
-        if (rms > p->smooth_bands[band])
-            p->smooth_bands[band] += (rms - p->smooth_bands[band]) * 0.6f;
+        float mag = sqrtf(re * re + im * im) * 2.0f / N;
+
+        /* Amplify and smooth: fast attack, medium release */
+        float val = mag * 5.0f;
+        if (val > p->smooth_bands[band])
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.8f;
         else
-            p->smooth_bands[band] += (rms - p->smooth_bands[band]) * 0.15f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.25f;
+        p->bands[band] = val;
         if (p->smooth_bands[band] > p->peak_bands[band])
             p->peak_bands[band] = p->smooth_bands[band];
         else
-            p->peak_bands[band] *= 0.97f;
+            p->peak_bands[band] *= 0.96f;
     }
+
+    /* Bass / Mid / Treble from real frequency bands */
     float bass=0, mid=0, treble=0;
     int b3 = NUM_BANDS / 3;
     for (int i = 0; i < b3; i++) bass += p->smooth_bands[i];
     for (int i = b3; i < 2*b3; i++) mid += p->smooth_bands[i];
     for (int i = 2*b3; i < NUM_BANDS; i++) treble += p->smooth_bands[i];
     bass /= b3; mid /= b3; treble /= (NUM_BANDS - 2*b3);
-    float tb = bass*12; if(tb>1)tb=1;
-    float tm = mid*16;  if(tm>1)tm=1;
-    float tt = treble*20; if(tt>1)tt=1;
-    p->bass += (tb - p->bass) * 0.3f;
-    p->mid += (tm - p->mid) * 0.3f;
-    p->treble += (tt - p->treble) * 0.3f;
+
+    /* Aggressive scaling + snappy smoothing */
+    float tb = bass * 25; if (tb > 1) tb = 1;
+    float tm = mid * 35;  if (tm > 1) tm = 1;
+    float tt = treble * 45; if (tt > 1) tt = 1;
+    p->bass += (tb - p->bass) * 0.6f;
+    p->mid += (tm - p->mid) * 0.6f;
+    p->treble += (tt - p->treble) * 0.6f;
     p->energy = (p->bass + p->mid + p->treble) / 3.0f;
 }
 
