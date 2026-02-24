@@ -67,6 +67,7 @@ vlc_module_begin ()
         change_integer_range( 0, 100 )
     add_integer( "auraviz-smooth", 50, "Smoothing", "0-100", false )
         change_integer_range( 0, 100 )
+    add_bool( "auraviz-ontop", true, "Always on top", "Keep visualization window above other windows", false )
     set_callbacks( Open, Close )
     add_shortcut( "auraviz" )
 vlc_module_end ()
@@ -824,8 +825,8 @@ static WINDOWPLACEMENT g_wp_prev = { sizeof(WINDOWPLACEMENT) };
 static int g_last_preset = 0;
 
 static volatile bool g_toggle_fs_pending = false;
-static volatile bool g_maximized = false;
-static volatile bool g_topmost_dirty = false;
+static volatile bool g_ontop = true;
+static volatile bool g_lock_position = false;
 
 static void toggle_fullscreen(HWND hwnd) {
     DWORD style = GetWindowLong(hwnd, GWL_STYLE);
@@ -833,33 +834,33 @@ static void toggle_fullscreen(HWND hwnd) {
         MONITORINFO mi = { sizeof(mi) };
         if (GetWindowPlacement(hwnd, &g_wp_prev) &&
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
-            /* Drop topmost and let Windows fully process it before touching anything else */
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE);
-            /* Now change style and reposition as a non-topmost window */
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-            SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
-                         SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
+                         SWP_FRAMECHANGED);
         }
         g_fullscreen = true;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
-        /* Restore topmost only if not maximized */
-        if (!g_maximized)
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetWindowPos(hwnd, g_ontop ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_FRAMECHANGED);
         g_fullscreen = false;
     }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_WINDOWPOSCHANGING: {
+            if (g_lock_position) {
+                WINDOWPOS *pos = (WINDOWPOS *)lp;
+                pos->flags |= SWP_NOMOVE | SWP_NOSIZE;
+            }
+            return 0;
+        }
         case WM_SIZE: {
             int w=LOWORD(lp),h=HIWORD(lp);
             if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;}
-            if (wp == SIZE_MAXIMIZED) { g_maximized = true; g_topmost_dirty = true; }
-            else if (wp == SIZE_RESTORED) { g_maximized = false; g_topmost_dirty = true; }
             return 0;
         }
         case WM_LBUTTONDBLCLK: g_toggle_fs_pending = true; return 0;
@@ -895,7 +896,7 @@ static int init_gl_context(auraviz_thread_t *p) {
     }
     DWORD style = WS_OVERLAPPEDWINDOW|WS_VISIBLE;
     RECT r = {0, 0, p->i_width, p->i_height}; AdjustWindowRect(&r, style, FALSE);
-    p->hwnd = CreateWindowExW(WS_EX_TOPMOST, WNDCLASS_NAME, L"AuraViz", style,
+    p->hwnd = CreateWindowExW(g_ontop ? WS_EX_TOPMOST : 0, WNDCLASS_NAME, L"AuraViz", style,
                               CW_USEDEFAULT, CW_USEDEFAULT, r.right-r.left, r.bottom-r.top,
                               NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!p->hwnd) return -1;
@@ -994,6 +995,8 @@ static void *Thread(void *p_data) {
     auraviz_thread_t *p = (auraviz_thread_t *)p_data;
     int canc = vlc_savecancel();
     if (init_gl_context(p) < 0) { msg_Err(p->p_obj, "GL init failed"); vlc_restorecancel(canc); return NULL; }
+    g_lock_position = false; /* Unlock window now that new thread owns it */
+    g_resized = false; /* Clear any stale resize from the transition */
     int shader_ok = 0;
     for (int i = 0; i < NUM_PRESETS; i++) { p->programs[i] = build_program(get_frag_body(i), p->p_obj); if (p->programs[i]) shader_ok++; }
     msg_Info(p->p_obj, "AuraViz: compiled %d/%d shaders", shader_ok, NUM_PRESETS);
@@ -1025,12 +1028,6 @@ static void *Thread(void *p_data) {
             wglMakeCurrent(p->hdc, p->hglrc);
         }
         if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_persistent_w=cur_w; g_persistent_h=cur_h; g_resized=false; }
-        /* Update topmost state outside WndProc to avoid recursive SetWindowPos issues */
-        if (g_topmost_dirty && !g_fullscreen) {
-            g_topmost_dirty = false;
-            SetWindowPos(p->hwnd, g_maximized ? HWND_NOTOPMOST : HWND_TOPMOST,
-                         0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        }
 
         block_t *p_block;
         vlc_mutex_lock(&p->lock);
@@ -1046,11 +1043,6 @@ static void *Thread(void *p_data) {
                 wglMakeCurrent(p->hdc, p->hglrc);
             }
             if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_persistent_w=cur_w; g_persistent_h=cur_h; g_resized=false; }
-            if (g_topmost_dirty && !g_fullscreen) {
-                g_topmost_dirty = false;
-                SetWindowPos(p->hwnd, g_maximized ? HWND_NOTOPMOST : HWND_TOPMOST,
-                             0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            }
             continue;
         }
         p_block = p->pp_blocks[0]; p->i_blocks--;
@@ -1149,6 +1141,9 @@ static int Open(vlc_object_t *p_this) {
     p_thread->user_preset = var_InheritInteger(p_filter, "auraviz-preset");
     p_thread->gain   = var_InheritInteger(p_this, "auraviz-gain");
     p_thread->smooth = var_InheritInteger(p_this, "auraviz-smooth");
+    g_ontop = var_InheritBool(p_filter, "auraviz-ontop");
+    /* Clear stale flags from previous thread */
+    g_resized = false; g_toggle_fs_pending = false;
     p_thread->i_channels = aout_FormatNbChannels(&p_filter->fmt_in.audio);
     p_thread->i_rate = p_filter->fmt_in.audio.i_rate;
     p_thread->p_obj  = p_this;
@@ -1176,6 +1171,7 @@ static int Open(vlc_object_t *p_this) {
 static void Close(vlc_object_t *p_this) {
     filter_t *p_filter = (filter_t *)p_this;
     struct filter_sys_t *p_sys = p_filter->p_sys;
+    g_lock_position = true; /* Lock window position during song transition */
     vlc_mutex_lock(&p_sys->p_thread->lock);
     p_sys->p_thread->b_exit = true;
     vlc_cond_signal(&p_sys->p_thread->wait);
