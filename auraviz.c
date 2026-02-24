@@ -815,8 +815,6 @@ static HWND g_persistent_hwnd = NULL;
 static HDC  g_persistent_hdc = NULL;
 static HGLRC g_persistent_hglrc = NULL;
 static int g_persistent_w = 0, g_persistent_h = 0;
-static WINDOWPLACEMENT g_persistent_wp = { sizeof(WINDOWPLACEMENT) };
-static bool g_has_persistent_wp = false;
 static bool g_wndclass_registered = false;
 static const wchar_t WNDCLASS_NAME[] = L"AuraVizClass";
 static volatile int g_resize_w = 0, g_resize_h = 0;
@@ -845,24 +843,24 @@ static void toggle_fullscreen(HWND hwnd) {
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        /* Flush the style + placement change without touching z-order */
         SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
-        /* Now restore topmost as a separate operation */
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        /* Restore topmost only if not maximized */
+        if (!g_maximized)
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         g_fullscreen = false;
     }
 }
+
+static volatile bool g_maximized = false;
+static volatile bool g_topmost_dirty = false;
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_SIZE: {
             int w=LOWORD(lp),h=HIWORD(lp);
             if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;}
-            /* Drop topmost when maximized, restore when returned to normal */
-            if (wp == SIZE_MAXIMIZED && !g_fullscreen)
-                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            else if (wp == SIZE_RESTORED && !g_fullscreen)
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            if (wp == SIZE_MAXIMIZED) { g_maximized = true; g_topmost_dirty = true; }
+            else if (wp == SIZE_RESTORED) { g_maximized = false; g_topmost_dirty = true; }
             return 0;
         }
         case WM_LBUTTONDBLCLK: g_toggle_fs_pending = true; return 0;
@@ -878,12 +876,7 @@ static int init_gl_context(auraviz_thread_t *p) {
     if (g_persistent_hwnd && IsWindow(g_persistent_hwnd)) {
         p->hwnd = g_persistent_hwnd; p->hdc = g_persistent_hdc; p->hglrc = g_persistent_hglrc;
         wglMakeCurrent(p->hdc, p->hglrc);
-        /* Restore exact window position/size/state from previous song */
-        if (g_has_persistent_wp) {
-            SetWindowPlacement(p->hwnd, &g_persistent_wp);
-        } else if (!IsWindowVisible(p->hwnd)) {
-            ShowWindow(p->hwnd, SW_SHOW);
-        }
+        if (!IsWindowVisible(p->hwnd)) ShowWindow(p->hwnd, SW_SHOWNA);
         RECT cr; GetClientRect(p->hwnd, &cr);
         p->i_width = cr.right - cr.left; p->i_height = cr.bottom - cr.top;
         g_persistent_w = p->i_width; g_persistent_h = p->i_height;
@@ -1033,6 +1026,12 @@ static void *Thread(void *p_data) {
             wglMakeCurrent(p->hdc, p->hglrc);
         }
         if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_persistent_w=cur_w; g_persistent_h=cur_h; g_resized=false; }
+        /* Update topmost state outside WndProc to avoid recursive SetWindowPos issues */
+        if (g_topmost_dirty && !g_fullscreen) {
+            g_topmost_dirty = false;
+            SetWindowPos(p->hwnd, g_maximized ? HWND_NOTOPMOST : HWND_TOPMOST,
+                         0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        }
 
         block_t *p_block;
         vlc_mutex_lock(&p->lock);
@@ -1048,6 +1047,11 @@ static void *Thread(void *p_data) {
                 wglMakeCurrent(p->hdc, p->hglrc);
             }
             if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_persistent_w=cur_w; g_persistent_h=cur_h; g_resized=false; }
+            if (g_topmost_dirty && !g_fullscreen) {
+                g_topmost_dirty = false;
+                SetWindowPos(p->hwnd, g_maximized ? HWND_NOTOPMOST : HWND_TOPMOST,
+                             0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            }
             continue;
         }
         p_block = p->pp_blocks[0]; p->i_blocks--;
@@ -1110,9 +1114,6 @@ static void *Thread(void *p_data) {
     if(p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
     destroy_fbos(p);
     g_last_preset = p->preset;
-    /* Save full window state (position, size, maximized/normal) for next song */
-    g_persistent_wp.length = sizeof(WINDOWPLACEMENT);
-    g_has_persistent_wp = GetWindowPlacement(p->hwnd, &g_persistent_wp);
     cleanup_gl(p); vlc_restorecancel(canc); return NULL;
 }
 
