@@ -18,9 +18,6 @@
 #ifdef _WIN32
 # include <winsock2.h>
 # include <ws2tcpip.h>
-# if !defined(poll)
-#  define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
-# endif
 #endif
 
 #include <vlc_common.h>
@@ -412,8 +409,6 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
 
     /* Peak gravity constants (frame-rate independent) */
     float peak_gravity = 3.5f - smooth_pct * 1.5f;      /* 3.5 to 2.0 units/s² */
-    float peak_hold_release = 0.5f + smooth_pct * 0.3f;  /* initial fall speed dampening */
-
     /* ── 11. Normalize, compress, smooth, peak-hold ── */
     for (int band = 0; band < NUM_BANDS; band++) {
         float norm = (raw_band[band] / agc_ref) * gain_mult;
