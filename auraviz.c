@@ -821,6 +821,9 @@ static volatile int g_resize_w = 0, g_resize_h = 0;
 static volatile bool g_resized = false;
 static volatile bool g_fullscreen = false;
 static WINDOWPLACEMENT g_wp_prev = { sizeof(WINDOWPLACEMENT) };
+static int g_last_preset = 0;
+
+static volatile bool g_toggle_fs_pending = false;
 
 static void toggle_fullscreen(HWND hwnd) {
     DWORD style = GetWindowLong(hwnd, GWL_STYLE);
@@ -831,13 +834,13 @@ static void toggle_fullscreen(HWND hwnd) {
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
             SetWindowPos(hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
-                         SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
+                         SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
         }
         g_fullscreen = true;
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
         g_fullscreen = false;
     }
 }
@@ -845,11 +848,11 @@ static void toggle_fullscreen(HWND hwnd) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_SIZE: { int w=LOWORD(lp),h=HIWORD(lp); if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;} return 0; }
-        case WM_LBUTTONDBLCLK: toggle_fullscreen(hwnd); return 0;
+        case WM_LBUTTONDBLCLK: g_toggle_fs_pending = true; return 0;
         case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
         case WM_KEYDOWN:
-            if(wp==VK_ESCAPE){if(g_fullscreen)toggle_fullscreen(hwnd);else ShowWindow(hwnd,SW_HIDE);return 0;}
-            if(wp==VK_F11||wp=='F'){toggle_fullscreen(hwnd);return 0;} break;
+            if(wp==VK_ESCAPE){if(g_fullscreen) g_toggle_fs_pending = true; else ShowWindow(hwnd,SW_HIDE);return 0;}
+            if(wp==VK_F11||wp=='F'){ g_toggle_fs_pending = true; return 0;} break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -862,6 +865,7 @@ static int init_gl_context(auraviz_thread_t *p) {
         if (!IsWindowVisible(p->hwnd)) ShowWindow(p->hwnd, SW_SHOW);
         RECT cr; GetClientRect(p->hwnd, &cr);
         p->i_width = cr.right - cr.left; p->i_height = cr.bottom - cr.top;
+        g_persistent_w = p->i_width; g_persistent_h = p->i_height;
         msg_Info(p->p_obj, "AuraViz: reusing window (%dx%d%s)", p->i_width, p->i_height,
                  g_fullscreen ? ", fullscreen" : "");
         if (load_gl_functions() < 0) return -1;
@@ -1000,13 +1004,31 @@ static void *Thread(void *p_data) {
 
     for (;;) {
         MSG msg; while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-        if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_resized=false; }
+        /* Handle deferred fullscreen toggle from render thread (GL context is current here) */
+        if (g_toggle_fs_pending) {
+            g_toggle_fs_pending = false;
+            toggle_fullscreen(p->hwnd);
+            /* Reassert GL context after window style change */
+            wglMakeCurrent(p->hdc, p->hglrc);
+        }
+        if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_persistent_w=cur_w; g_persistent_h=cur_h; g_resized=false; }
 
         block_t *p_block;
         vlc_mutex_lock(&p->lock);
         if (p->i_blocks == 0 && !p->b_exit) vlc_cond_timedwait(&p->wait, &p->lock, mdate() + 16000);
         if (p->b_exit) { vlc_mutex_unlock(&p->lock); break; }
-        if (p->i_blocks == 0) { vlc_mutex_unlock(&p->lock); continue; }
+        if (p->i_blocks == 0) {
+            vlc_mutex_unlock(&p->lock);
+            /* Keep pumping messages even when no audio (prevents fullscreen freeze) */
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+            if (g_toggle_fs_pending) {
+                g_toggle_fs_pending = false;
+                toggle_fullscreen(p->hwnd);
+                wglMakeCurrent(p->hdc, p->hglrc);
+            }
+            if (g_resized) { cur_w=g_resize_w; cur_h=g_resize_h; glViewport(0,0,cur_w,cur_h); resize_fbos(p, cur_w, cur_h); g_persistent_w=cur_w; g_persistent_h=cur_h; g_resized=false; }
+            continue;
+        }
         p_block = p->pp_blocks[0]; p->i_blocks--;
         memmove(p->pp_blocks, &p->pp_blocks[1], p->i_blocks * sizeof(block_t *));
         vlc_mutex_unlock(&p->lock);
@@ -1066,6 +1088,7 @@ static void *Thread(void *p_data) {
     if(p->blend_program) gl_DeleteProgram(p->blend_program);
     if(p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
     destroy_fbos(p);
+    g_last_preset = p->preset;
     cleanup_gl(p); vlc_restorecancel(canc); return NULL;
 }
 
@@ -1094,6 +1117,11 @@ static int Open(vlc_object_t *p_this) {
     if (!p_thread) { free(p_sys); return VLC_ENOMEM; }
     p_thread->i_width  = var_InheritInteger(p_filter, "auraviz-width");
     p_thread->i_height = var_InheritInteger(p_filter, "auraviz-height");
+    /* If window already exists, use its current size instead of defaults */
+    if (g_persistent_hwnd && g_persistent_w > 0 && g_persistent_h > 0) {
+        p_thread->i_width = g_persistent_w;
+        p_thread->i_height = g_persistent_h;
+    }
     p_thread->user_preset = var_InheritInteger(p_filter, "auraviz-preset");
     p_thread->gain   = var_InheritInteger(p_this, "auraviz-gain");
     p_thread->smooth = var_InheritInteger(p_this, "auraviz-smooth");
@@ -1105,6 +1133,8 @@ static int Open(vlc_object_t *p_this) {
     p_thread->agc_envelope=0.001f; p_thread->agc_peak=0.001f;
     p_thread->onset_avg=0.01f; p_thread->dt=0.02f;
     p_thread->crossfade_t = 0.0f; p_thread->crossfading = false; p_thread->prev_preset = 0;
+    /* Restore preset from previous song if auto-cycling */
+    if (g_persistent_hwnd) p_thread->preset = g_last_preset;
     vlc_mutex_init(&p_thread->lock); vlc_cond_init(&p_thread->wait);
     p_thread->b_exit = false;
     if (vlc_clone(&p_thread->thread, Thread, p_thread, VLC_THREAD_PRIORITY_LOW)) {
