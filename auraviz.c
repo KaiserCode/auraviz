@@ -824,6 +824,8 @@ static WINDOWPLACEMENT g_wp_prev = { sizeof(WINDOWPLACEMENT) };
 static int g_last_preset = 0;
 
 static volatile bool g_toggle_fs_pending = false;
+static volatile bool g_maximized = false;
+static volatile bool g_topmost_dirty = false;
 
 static void toggle_fullscreen(HWND hwnd) {
     DWORD style = GetWindowLong(hwnd, GWL_STYLE);
@@ -850,9 +852,6 @@ static void toggle_fullscreen(HWND hwnd) {
         g_fullscreen = false;
     }
 }
-
-static volatile bool g_maximized = false;
-static volatile bool g_topmost_dirty = false;
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
