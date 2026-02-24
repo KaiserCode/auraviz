@@ -18,6 +18,9 @@
 #ifdef _WIN32
 # include <winsock2.h>
 # include <ws2tcpip.h>
+# if !defined(poll)
+#  define poll(fds, nfds, timeout) WSAPoll((fds), (nfds), (timeout))
+# endif
 #endif
 
 #include <vlc_common.h>
