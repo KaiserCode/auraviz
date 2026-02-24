@@ -831,8 +831,10 @@ static void toggle_fullscreen(HWND hwnd) {
         MONITORINFO mi = { sizeof(mi) };
         if (GetWindowPlacement(hwnd, &g_wp_prev) &&
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            /* Drop topmost FIRST — combining TOPMOST + style change + resize causes freezes */
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-            SetWindowPos(hwnd, HWND_TOPMOST, mi.rcMonitor.left, mi.rcMonitor.top,
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
                          SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
         }
@@ -840,6 +842,7 @@ static void toggle_fullscreen(HWND hwnd) {
     } else {
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
+        /* Restore topmost for normal windowed mode */
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_NOCOPYBITS);
         g_fullscreen = false;
     }
@@ -847,7 +850,16 @@ static void toggle_fullscreen(HWND hwnd) {
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_SIZE: { int w=LOWORD(lp),h=HIWORD(lp); if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;} return 0; }
+        case WM_SIZE: {
+            int w=LOWORD(lp),h=HIWORD(lp);
+            if(w>0&&h>0){g_resize_w=w;g_resize_h=h;g_resized=true;}
+            /* Drop topmost when maximized, restore when returned to normal */
+            if (wp == SIZE_MAXIMIZED && !g_fullscreen)
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            else if (wp == SIZE_RESTORED && !g_fullscreen)
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            return 0;
+        }
         case WM_LBUTTONDBLCLK: g_toggle_fs_pending = true; return 0;
         case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
         case WM_KEYDOWN:
