@@ -83,6 +83,7 @@ typedef struct
     float smooth_bands[NUM_BANDS];
     float peak_bands[NUM_BANDS];
     float bass, mid, treble, energy;
+    float agc_peak;
     float time_acc;
     unsigned int frame_count;
     int   preset;
@@ -168,10 +169,10 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
         mono[i] *= w;
     }
 
-    /* Compute DFT magnitude for log-spaced frequency bins.
-       One DFT bin per band at the center frequency. */
+    /* DFT: one bin per band at log-spaced center frequency */
+    float raw_mag[NUM_BANDS];
+    float frame_max = 0.0001f;  /* floor to avoid div by zero */
     for (int band = 0; band < NUM_BANDS; band++) {
-        /* Log-spaced: band 0 ~ 30Hz, band 63 ~ 15kHz */
         float freq = 30.0f * powf(500.0f, (float)band / (NUM_BANDS - 1));
         int k = (int)(freq * N / 44100.0f + 0.5f);
         if (k < 1) k = 1;
@@ -185,13 +186,31 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
             im -= mono[n] * sinf(a);
         }
         float mag = sqrtf(re * re + im * im) * 2.0f / N;
+        raw_mag[band] = mag;
+        if (mag > frame_max) frame_max = mag;
+    }
 
-        /* Amplify and smooth: fast attack, medium release */
-        float val = mag * 5.0f;
+    /* Automatic gain control: track recent peak with slow decay */
+    if (frame_max > p->agc_peak)
+        p->agc_peak = frame_max;
+    else
+        p->agc_peak *= 0.995f;  /* decay ~0.5% per frame */
+    if (p->agc_peak < 0.0001f) p->agc_peak = 0.0001f;
+
+    /* Normalize bands relative to AGC peak, apply dB-like curve */
+    for (int band = 0; band < NUM_BANDS; band++) {
+        /* Normalize to 0-1 range using AGC */
+        float norm = raw_mag[band] / p->agc_peak;
+
+        /* Apply power curve for more dynamic range (sqrt gives ~dB feel) */
+        float val = sqrtf(norm);
+
+        /* Smooth: fast attack, medium release */
         if (val > p->smooth_bands[band])
-            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.8f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.7f;
         else
-            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.25f;
+            p->smooth_bands[band] += (val - p->smooth_bands[band]) * 0.3f;
+
         p->bands[band] = val;
         if (p->smooth_bands[band] > p->peak_bands[band])
             p->peak_bands[band] = p->smooth_bands[band];
@@ -207,13 +226,10 @@ static void analyze_audio(auraviz_thread_t *p, const float *samples,
     for (int i = 2*b3; i < NUM_BANDS; i++) treble += p->smooth_bands[i];
     bass /= b3; mid /= b3; treble /= (NUM_BANDS - 2*b3);
 
-    /* Aggressive scaling + snappy smoothing */
-    float tb = bass * 25; if (tb > 1) tb = 1;
-    float tm = mid * 35;  if (tm > 1) tm = 1;
-    float tt = treble * 45; if (tt > 1) tt = 1;
-    p->bass += (tb - p->bass) * 0.6f;
-    p->mid += (tm - p->mid) * 0.6f;
-    p->treble += (tt - p->treble) * 0.6f;
+    /* Fast smoothing so beats come through */
+    p->bass += (bass - p->bass) * 0.6f;
+    p->mid += (mid - p->mid) * 0.6f;
+    p->treble += (treble - p->treble) * 0.6f;
     p->energy = (p->bass + p->mid + p->treble) / 3.0f;
 }
 
