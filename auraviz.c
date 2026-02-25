@@ -289,65 +289,64 @@ static GLuint build_blend_program(vlc_object_t *obj) {
 static const char *frag_spectrum =
     "void main() {\n"
     "    vec2 uv = gl_FragCoord.xy / u_resolution;\n"
-    "    float NUM = 48.0;\n"
+    "    vec3 col = vec3(0.0);\n"
+    "    float NUM = 80.0;\n"
     "    float barIdx = floor(uv.x * NUM);\n"
     "    float barCenter = (barIdx + 0.5) / NUM;\n"
     "    float barLocal = fract(uv.x * NUM);\n"
-    "    float gap = smoothstep(0.0, 0.08, barLocal) * smoothstep(1.0, 0.92, barLocal);\n"
-    "    float s = spec(barCenter) * (1.0 + u_bass * 0.6 + u_beat * 1.0);\n"
-    "    float h = s * 0.9;\n"
-    /* upper half: bars rising from center */
-    "    float yUp = (uv.y - 0.5) * 2.0;\n"
-    "    float barMask = gap * smoothstep(h, h - 0.015, yUp) * step(0.0, yUp);\n"
-    /* lower half: reflection, dimmed and fading */
-    "    float yDn = (0.5 - uv.y) * 2.0;\n"
-    "    float refl = gap * smoothstep(h, h - 0.015, yDn) * step(0.0, yDn) * (1.0 - yDn * 1.2) * 0.35;\n"
-    /* color: hue shifts across bars, bright at top */
-    "    float hue = barCenter * 0.7 + u_time * 0.04;\n"
-    "    float topGrad = yUp / max(h, 0.01);\n"
-    "    vec3 barCol = hsv2rgb(vec3(hue, 0.8, 0.4 + topGrad * 0.6));\n"
-    /* glow at the tip */
-    "    float tipGlow = exp(-abs(yUp - h) * 60.0) * s * 0.8;\n"
-    "    vec3 glowCol = hsv2rgb(vec3(hue, 0.5, 1.0));\n"
-    /* beat flash on the floor */
-    "    float floorLine = exp(-abs(uv.y - 0.5) * 80.0) * u_beat * 0.15;\n"
-    "    vec3 col = barCol * barMask + barCol * refl + glowCol * tipGlow * gap + vec3(floorLine);\n"
-    /* subtle vignette */
-    "    col *= 1.0 - 0.3 * length(uv - 0.5);\n"
+    "    float gap = smoothstep(0.0, 0.06, barLocal) * smoothstep(1.0, 0.94, barLocal);\n"
+    "    float s = spec(barCenter);\n"
+    "    float boost = 1.5 + u_bass * 1.2 + u_beat * 2.0;\n"
+    "    float h = clamp(s * boost, 0.0, 1.0);\n"
+    "    float barMask = gap * step(uv.y, h);\n"
+    "    float scanline = 0.85 + 0.15 * sin(uv.y * 200.0);\n"
+    "    float grad = uv.y / max(h, 0.01);\n"
+    "    float hue = mod(barCenter * 0.8 + u_time * 0.05, 1.0);\n"
+    "    vec3 barCol = hsv2rgb(vec3(hue, 0.85, 0.3 + grad * 0.7)) * scanline;\n"
+    "    col += barCol * barMask;\n"
+    "    float tipGlow = exp(-abs(uv.y - h) * 40.0) * s * 1.5 * gap;\n"
+    "    col += hsv2rgb(vec3(hue, 0.4, 1.0)) * tipGlow;\n"
+    "    float h2 = clamp(s * boost * 0.6, 0.0, 1.0);\n"
+    "    float topY = 1.0 - uv.y;\n"
+    "    float topMask = gap * step(topY, h2) * 0.4;\n"
+    "    col += hsv2rgb(vec3(hue + 0.5, 0.7, 0.2 + (topY / max(h2, 0.01)) * 0.5)) * topMask * scanline;\n"
+    "    float glow = s * 0.15 * exp(-abs(uv.y - h * 0.5) * 3.0);\n"
+    "    col += hsv2rgb(vec3(hue, 0.6, 1.0)) * glow;\n"
+    "    float floorPulse = exp(-uv.y * 8.0) * u_bass * 0.3;\n"
+    "    col += vec3(floorPulse * 0.3, floorPulse * 0.1, floorPulse * 0.5);\n"
+    "    col += vec3(1.0, 0.9, 0.8) * u_beat * 0.08;\n"
     "    gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);\n}\n";
 
 static const char *frag_wave =
     "void main() {\n"
     "    vec2 uv = gl_FragCoord.xy / u_resolution;\n"
     "    vec3 col = vec3(0.0);\n"
-    "    float energy = u_bass * 0.4 + u_beat * 0.6;\n"
-    /* three layered waves with different speeds and amplitude */
-    "    for (int L = 0; L < 3; L++) {\n"
+    "    float energy = 1.0 + u_bass * 1.5 + u_beat * 2.0;\n"
+    "    for (int L = 0; L < 7; L++) {\n"
     "        float fl = float(L);\n"
-    "        float amp = (0.15 + fl * 0.06) * (1.0 + energy);\n"
-    "        float freq = 8.0 + fl * 4.0;\n"
-    "        float spd = 2.0 + fl * 0.8;\n"
-    "        float phase = u_time * spd + fl * 2.09;\n"
-    "        float s = spec(uv.x) * amp;\n"
-    "        float wave = 0.5 + s * sin(uv.x * freq + phase);\n"
-    /* thick glow line */
-    "        float thickness = 0.003 + s * 0.004;\n"
+    "        float amp = (0.2 + fl * 0.04) * energy;\n"
+    "        float freq = 6.0 + fl * 3.0;\n"
+    "        float spd = 1.5 + fl * 0.6;\n"
+    "        float phase = u_time * spd + fl * 0.9;\n"
+    "        float wave = 0.5;\n"
+    "        wave += spec(uv.x) * amp * sin(uv.x * freq + phase);\n"
+    "        wave += spec(mod(uv.x + 0.3, 1.0)) * amp * 0.5 * sin(uv.x * freq * 1.7 + phase * 1.3);\n"
     "        float d = abs(uv.y - wave);\n"
-    "        float line = thickness / (d + thickness);\n"
-    /* soft fill between wave and center */
-    "        float fillDist = (uv.y - 0.5) * sign(wave - 0.5);\n"
-    "        float fill = smoothstep(abs(wave - 0.5), 0.0, abs(uv.y - 0.5)) * 0.08;\n"
-    /* layer color - offset hues */
-    "        float hue = mod(uv.x * 0.3 + u_time * 0.08 + fl * 0.33, 1.0);\n"
-    "        float sat = 0.7 + fl * 0.1;\n"
-    "        vec3 lc = hsv2rgb(vec3(hue, sat, 0.9 - fl * 0.15));\n"
-    "        col += lc * (line * (0.7 - fl * 0.15) + fill);\n"
+    "        float thick = 0.004 + spec(uv.x) * 0.008;\n"
+    "        float line = thick / (d + thick);\n"
+    "        float fill = smoothstep(abs(wave - 0.5) + 0.05, 0.0, abs(uv.y - 0.5)) * 0.12;\n"
+    "        float hue = mod(uv.x * 0.4 + u_time * 0.06 + fl * 0.14, 1.0);\n"
+    "        vec3 lc = hsv2rgb(vec3(hue, 0.8 - fl * 0.05, 1.0));\n"
+    "        col += lc * (line * (0.8 - fl * 0.07) + fill);\n"
     "    }\n"
-    /* center line pulse */
-    "    float centerLine = exp(-abs(uv.y - 0.5) * 120.0) * 0.12 * (1.0 + u_beat);\n"
-    "    col += vec3(centerLine * 0.5, centerLine * 0.7, centerLine);\n"
-    /* vignette */
-    "    col *= 1.0 - 0.35 * pow(length(uv - 0.5) * 1.4, 2.0);\n"
+    "    float s = spec(uv.x);\n"
+    "    float bgGlow = s * 0.2 * (1.0 + u_beat);\n"
+    "    col += hsv2rgb(vec3(mod(uv.x + u_time * 0.03, 1.0), 0.5, 1.0)) * bgGlow;\n"
+    "    float centerPulse = exp(-abs(uv.y - 0.5) * 30.0) * (0.15 + u_beat * 0.3);\n"
+    "    col += vec3(centerPulse * 0.4, centerPulse * 0.8, centerPulse * 1.0);\n"
+    "    float edgeGlow = exp(-uv.y * 6.0) * 0.08 + exp(-(1.0 - uv.y) * 6.0) * 0.08;\n"
+    "    col += vec3(edgeGlow * 0.5, edgeGlow * 0.2, edgeGlow * 0.8);\n"
+    "    col += vec3(1.0, 0.95, 0.9) * u_beat * 0.06;\n"
     "    gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);\n}\n";
 
 static const char *frag_circular =
@@ -357,48 +356,60 @@ static const char *frag_circular =
     "    float dist = length(uv);\n"
     "    float angle = atan(uv.y, uv.x);\n"
     "    float a01 = angle / 6.28318 + 0.5;\n"
-    "    float energy = u_bass * 0.5 + u_beat * 0.8;\n"
+    "    float energy = 1.0 + u_bass * 1.0 + u_beat * 2.0;\n"
     "    vec3 col = vec3(0.0);\n"
-    /* spectrum ring - bars radiating outward */
-    "    float baseR = 0.35;\n"
-    "    float NUM = 64.0;\n"
+    "    float baseR = 0.25;\n"
+    "    float NUM = 96.0;\n"
     "    float seg = floor(a01 * NUM);\n"
     "    float segCenter = (seg + 0.5) / NUM;\n"
     "    float segLocal = fract(a01 * NUM);\n"
-    "    float segGap = smoothstep(0.0, 0.15, segLocal) * smoothstep(1.0, 0.85, segLocal);\n"
-    "    float s = spec(segCenter) * (0.4 + energy * 0.3);\n"
-    "    float barOuter = baseR + s;\n"
-    "    float barMask = segGap * step(baseR - 0.01, dist) * step(dist, barOuter);\n"
-    /* color by angle, brighter at tip */
-    "    float radial = (dist - baseR) / max(s, 0.001);\n"
+    "    float segGap = smoothstep(0.0, 0.1, segLocal) * smoothstep(1.0, 0.9, segLocal);\n"
+    "    float s = spec(segCenter) * energy;\n"
+    "    float barOuter = baseR + s * 0.7;\n"
+    "    float barMask = segGap * step(baseR, dist) * step(dist, barOuter);\n"
+    "    float radial = (dist - baseR) / max(s * 0.7, 0.001);\n"
     "    float hue = mod(segCenter + u_time * 0.06, 1.0);\n"
-    "    vec3 barCol = hsv2rgb(vec3(hue, 0.75, 0.4 + radial * 0.6));\n"
-    "    col += barCol * barMask;\n"
-    /* outer glow ring at the tips */
-    "    float tipR = baseR + spec(a01) * (0.4 + energy * 0.3);\n"
-    "    float ringGlow = 0.005 / (abs(dist - tipR) + 0.005) * 0.6;\n"
-    "    col += hsv2rgb(vec3(hue, 0.5, 1.0)) * ringGlow;\n"
-    /* inner glow ring */
-    "    float innerGlow = 0.003 / (abs(dist - baseR) + 0.003) * 0.4;\n"
-    "    col += vec3(0.3, 0.5, 0.8) * innerGlow;\n"
-    /* center filled circle - pulses with bass */
-    "    float centerR = 0.15 + u_bass * 0.05;\n"
-    "    float centerMask = smoothstep(centerR, centerR - 0.06, dist);\n"
-    "    float cHue = mod(u_time * 0.1, 1.0);\n"
-    "    col += hsv2rgb(vec3(cHue, 0.6, 0.15 + u_beat * 0.15)) * centerMask;\n"
-    /* spinning dot particles on the ring */
-    "    for (int i = 0; i < 12; i++) {\n"
-    "        float fi = float(i);\n"
-    "        float pAngle = fi / 12.0 * 6.28318 + u_time * (1.0 + fi * 0.1);\n"
-    "        float pR = baseR + spec(fi / 12.0) * 0.25;\n"
-    "        vec2 pp = vec2(cos(pAngle), sin(pAngle)) * pR;\n"
-    "        float pd = length(uv - pp);\n"
-    "        float dot = 0.003 / (pd * pd + 0.003) * 0.15;\n"
-    "        col += hsv2rgb(vec3(fi / 12.0, 0.6, 1.0)) * dot;\n"
+    "    vec3 barCol = hsv2rgb(vec3(hue, 0.8, 0.3 + radial * 0.7));\n"
+    "    float barScan = 0.85 + 0.15 * sin(dist * 80.0 + a01 * 40.0);\n"
+    "    col += barCol * barMask * barScan;\n"
+    "    float tipR = baseR + spec(a01) * 0.7 * energy;\n"
+    "    float ringGlow = 0.006 / (abs(dist - tipR) + 0.006);\n"
+    "    col += hsv2rgb(vec3(hue, 0.4, 1.0)) * ringGlow * 0.7;\n"
+    "    float innerGlow = 0.004 / (abs(dist - baseR) + 0.004);\n"
+    "    col += hsv2rgb(vec3(mod(a01 + u_time * 0.1, 1.0), 0.6, 0.8)) * innerGlow * 0.5;\n"
+    "    float inS = spec(a01) * energy;\n"
+    "    float innerBar = baseR - inS * 0.3;\n"
+    "    float inMask = segGap * step(innerBar, dist) * step(dist, baseR) * 0.5;\n"
+    "    col += hsv2rgb(vec3(hue + 0.5, 0.7, 0.3 + (1.0 - radial) * 0.5)) * inMask * barScan;\n"
+    "    for (int ring = 0; ring < 3; ring++) {\n"
+    "        float fr = float(ring);\n"
+    "        float rr = 0.15 + fr * 0.4;\n"
+    "        float rGlow = 0.002 / (abs(dist - rr) + 0.002) * 0.2;\n"
+    "        col += hsv2rgb(vec3(mod(u_time * 0.05 + fr * 0.33, 1.0), 0.3, 0.6)) * rGlow;\n"
     "    }\n"
-    /* vignette */
-    "    col *= 1.0 - 0.4 * smoothstep(0.5, 1.5, dist);\n"
+    "    float sunR = 0.12 + u_bass * 0.08 + u_beat * 0.06;\n"
+    "    float sunMask = smoothstep(sunR, 0.0, dist);\n"
+    "    float sunPulse = 1.0 + u_beat * 1.5 + u_bass * 0.8;\n"
+    "    float sunHue = mod(u_time * 0.08, 1.0);\n"
+    "    vec3 sunCore = hsv2rgb(vec3(sunHue, 0.3, 1.0)) * sunPulse;\n"
+    "    vec3 sunEdge = hsv2rgb(vec3(sunHue + 0.1, 0.8, 1.0));\n"
+    "    col += mix(sunEdge, sunCore, smoothstep(sunR, 0.0, dist)) * sunMask;\n"
+    "    float coronaGlow = 0.02 / (dist + 0.02) * (0.4 + u_beat * 0.6);\n"
+    "    col += hsv2rgb(vec3(sunHue, 0.5, 1.0)) * coronaGlow * 0.3;\n"
+    "    for (int i = 0; i < 20; i++) {\n"
+    "        float fi = float(i);\n"
+    "        float pA = fi / 20.0 * 6.28318 + u_time * (0.8 + fi * 0.15);\n"
+    "        float pR = baseR + spec(fi / 20.0) * 0.5 * energy;\n"
+    "        vec2 pp = vec2(cos(pA), sin(pA)) * pR;\n"
+    "        float pd = length(uv - pp);\n"
+    "        float dot = 0.002 / (pd * pd + 0.002) * 0.2;\n"
+    "        col += hsv2rgb(vec3(fi / 20.0 + u_time * 0.05, 0.6, 1.0)) * dot;\n"
+    "    }\n"
+    "    float radPattern = sin(dist * 30.0 - u_time * 3.0) * 0.03 * spec(a01);\n"
+    "    col += vec3(radPattern) * step(baseR, dist);\n"
+    "    col += vec3(1.0, 0.95, 0.9) * u_beat * 0.05;\n"
     "    gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);\n}\n";
+
 
 static const char *frag_particles =
     "void main() {\n"
@@ -910,6 +921,78 @@ static int g_last_preset = 0;
 static volatile bool g_toggle_fs_pending = false;
 static volatile bool g_ontop = true;
 static volatile bool g_lock_position = false;
+static HICON g_app_icon = NULL;
+
+/* Create a 32x32 RGBA icon programmatically (spectrum circle design) */
+static HICON create_auraviz_icon(void) {
+    const int S = 32;
+    BYTE color[32*32*4]; /* BGRA */
+    BYTE mask[32*32/8];
+    memset(color, 0, sizeof(color));
+    memset(mask, 0, sizeof(mask));  /* 0 = opaque */
+    int cx = S/2, cy = S/2;
+    for (int y = 0; y < S; y++) {
+        for (int x = 0; x < S; x++) {
+            int dx = x - cx, dy = y - cy;
+            float dist = sqrtf((float)(dx*dx + dy*dy));
+            int idx = (y * S + x) * 4;
+            if (dist < 14.5f) {
+                /* inside circle */
+                float angle = atan2f((float)dy, (float)dx);
+                float a01 = angle / 6.28318f + 0.5f;
+                /* simulate spectrum bar height */
+                float barH = 4.0f + 6.0f * (0.5f + 0.5f * sinf(a01 * 15.0f));
+                float innerR = 6.0f, outerR = innerR + barH;
+                BYTE r, g, b;
+                if (dist >= innerR && dist <= outerR) {
+                    /* bar region: cyan to magenta hue */
+                    float t = a01;
+                    float hue = t * 360.0f;
+                    float h6 = hue / 60.0f;
+                    int hi = (int)h6 % 6;
+                    float f = h6 - (int)h6;
+                    float br = 200 + (dist - innerR) / barH * 55;
+                    BYTE V = (BYTE)(br > 255 ? 255 : br);
+                    BYTE q = (BYTE)(V * (1.0f - 0.8f * f));
+                    BYTE t2 = (BYTE)(V * (1.0f - 0.8f * (1.0f - f)));
+                    BYTE p2 = (BYTE)(V * 0.2f);
+                    switch(hi) {
+                        case 0: r=V; g=t2; b=p2; break;
+                        case 1: r=q; g=V; b=p2; break;
+                        case 2: r=p2; g=V; b=t2; break;
+                        case 3: r=p2; g=q; b=V; break;
+                        case 4: r=t2; g=p2; b=V; break;
+                        default: r=V; g=p2; b=q; break;
+                    }
+                } else if (dist < innerR) {
+                    /* center: bright cyan core */
+                    float t = 1.0f - dist / innerR;
+                    r = (BYTE)(t * 80);
+                    g = (BYTE)(180 + t * 75);
+                    b = (BYTE)(200 + t * 55);
+                } else {
+                    r = 13; g = 13; b = 26; /* dark background */
+                }
+                color[idx+0] = b; color[idx+1] = g;
+                color[idx+2] = r; color[idx+3] = 255;
+            } else {
+                /* outside circle: transparent */
+                int maskByte = (y * S + x) / 8;
+                int maskBit = 7 - ((y * S + x) % 8);
+                mask[maskByte] |= (1 << maskBit);
+            }
+        }
+    }
+    return CreateIcon(GetModuleHandle(NULL), S, S, 1, 32, mask, color);
+}
+
+static void set_window_icon(HWND hwnd) {
+    if (!g_app_icon) g_app_icon = create_auraviz_icon();
+    if (g_app_icon) {
+        SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_app_icon);
+        SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_app_icon);
+    }
+}
 
 static void toggle_fullscreen(HWND hwnd) {
     DWORD style = GetWindowLong(hwnd, GWL_STYLE);
@@ -960,6 +1043,7 @@ static int init_gl_context(auraviz_thread_t *p) {
         p->hwnd = g_persistent_hwnd; p->hdc = g_persistent_hdc; p->hglrc = g_persistent_hglrc;
         wglMakeCurrent(p->hdc, p->hglrc);
         if (!IsWindowVisible(p->hwnd)) ShowWindow(p->hwnd, SW_SHOWNA);
+        set_window_icon(p->hwnd);
         RECT cr; GetClientRect(p->hwnd, &cr);
         p->i_width = cr.right - cr.left; p->i_height = cr.bottom - cr.top;
         g_persistent_w = p->i_width; g_persistent_h = p->i_height;
@@ -983,6 +1067,7 @@ static int init_gl_context(auraviz_thread_t *p) {
                               CW_USEDEFAULT, CW_USEDEFAULT, r.right-r.left, r.bottom-r.top,
                               NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!p->hwnd) return -1;
+    set_window_icon(p->hwnd);
     p->hdc = GetDC(p->hwnd);
     PIXELFORMATDESCRIPTOR pfd = {0};
     pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
