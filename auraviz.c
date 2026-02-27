@@ -46,7 +46,7 @@
 #define VOUT_HEIGHT         500
 #define NUM_BANDS           64
 #define MAX_BLOCKS          100
-#define NUM_PRESETS         46
+#define NUM_PRESETS         52
 #define FFT_N               1024
 #define RING_SIZE           4096
 #define CROSSFADE_DURATION  1.5f
@@ -515,11 +515,30 @@ static const char *frag_starburst =
 static const char *frag_storm =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float t=u_time; vec3 col=vec3(0.0);\n"
-    "    for(int i=0;i<6;i++){float fi=float(i), angle=fi*1.0472+t*0.4;\n"
-    "        vec2 dir=vec2(cos(angle),sin(angle));\n"
-    "        float d=abs(dot(uv,dir.yx*vec2(1,-1)))+noise(vec2(dot(uv,dir)*10.0+t*3.0,fi*7.0))*0.08*u_energy;\n"
-    "        col+=hsv2rgb(vec3(mod(0.6+fi*0.1+t*0.05,1.0),0.5,1.0))*0.005/(d+0.005)*(0.3+spec(fi/6.0)*0.7+u_beat*0.3);}\n"
+    "    float t=u_time; float dist=length(uv); float ang=atan(uv.y,uv.x);\n"
+    "    float swirl_a=ang-t*0.3-dist*2.0;\n"
+    "    float bg_n=noise(vec2(cos(swirl_a)*dist*3.0+t*0.5,sin(swirl_a)*dist*3.0))*0.5\n"
+    "        +noise(vec2(cos(swirl_a*2.0)*dist*5.0,sin(swirl_a*2.0)*dist*5.0+t*0.3))*0.3;\n"
+    "    vec3 col=hsv2rgb(vec3(mod(0.6+bg_n*0.15+t*0.02,1.0),0.6,0.08+bg_n*0.12+u_energy*0.06));\n"
+    "    for(int i=0;i<10;i++){float fi=float(i);\n"
+    "        float bolt_ang=fi*0.628+t*0.5+sin(t*0.3+fi*2.0)*0.5;\n"
+    "        vec2 bolt_dir=vec2(cos(bolt_ang),sin(bolt_ang));\n"
+    "        float along=dot(uv,bolt_dir);\n"
+    "        float perp=dot(uv,vec2(-bolt_dir.y,bolt_dir.x));\n"
+    "        float jag=noise(vec2(along*15.0+fi*5.0,t*6.0+fi*3.0))*0.12*(1.0+u_beat*0.8);\n"
+    "        jag+=noise(vec2(along*30.0+fi*11.0,t*10.0))*0.05*u_energy;\n"
+    "        float d=abs(perp-jag);\n"
+    "        float bolt_len=0.6+spec(fi/10.0)*0.4+u_bass*0.3;\n"
+    "        float bolt_mask=smoothstep(bolt_len,bolt_len*0.3,abs(along));\n"
+    "        float sp=spec(mod(fi*6.0,64.0)/64.0);\n"
+    "        float glow=0.004/(d+0.004)*bolt_mask*(0.4+sp*0.8+u_beat*0.4);\n"
+    "        float branch=noise(vec2(along*25.0+fi*7.0,t*8.0+fi))*0.008/(d+0.008)*bolt_mask*0.3;\n"
+    "        float hue=mod(0.55+fi*0.04+t*0.03,1.0);\n"
+    "        col+=hsv2rgb(vec3(hue,0.4,1.0))*glow;\n"
+    "        col+=vec3(0.7,0.8,1.0)*branch*u_energy;\n"
+    "    }\n"
+    "    float core_flash=exp(-dist*dist*3.0)*u_beat*0.3;\n"
+    "    col+=vec3(0.6,0.7,1.0)*core_flash;\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_ripple =
@@ -1445,6 +1464,173 @@ static const char *frag_diamondripple =
     "    col+=vec3(0.8,0.85,1.0)*u_beat*0.04;\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
+static const char *frag_spiralfractalwarp =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float t=u_time*0.3;\n"
+    "    float dist=length(uv)+0.001; float ang=atan(uv.y,uv.x);\n"
+    "    float spiral=ang+log(dist)*3.0*(1.0+u_bass*0.5)-t*2.0;\n"
+    "    vec2 p=vec2(cos(spiral),sin(spiral))*dist*3.0;\n"
+    "    for(int i=0;i<8;i++){\n"
+    "        p=abs(p)/dot(p,p)-vec2(1.0+u_bass*0.2+sin(t+float(i))*0.1,0.8+u_treble*0.15);\n"
+    "        float ca=cos(t*0.5+float(i)*0.3),sa=sin(t*0.5+float(i)*0.3);\n"
+    "        p=vec2(p.x*ca-p.y*sa,p.x*sa+p.y*ca);\n"
+    "    }\n"
+    "    float val=length(p)*(0.25+u_energy*0.6+u_beat*0.25);\n"
+    "    float hue=mod(val*0.2+spiral*0.05+t*0.08,1.0);\n"
+    "    float sat=0.7+0.3*sin(val*3.0);\n"
+    "    vec3 col=hsv2rgb(vec3(hue,sat,clamp(val,0.0,1.0)));\n"
+    "    col+=hsv2rgb(vec3(mod(hue+0.5,1.0),0.5,0.06));\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+/* === HYBRID PRESETS === */
+
+/* Nebula Lightning Storm: nebula clouds + lightning arcs + aurora curtains */
+static const char *frag_nebulastorm =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 uv01=gl_FragCoord.xy/u_resolution; float t=u_time;\n"
+    "    vec2 p=uv01*3.0; float nt=t*0.2;\n"
+    "    float nebula=noise(p+nt)*0.5+noise(p*2.0+nt*1.5)*0.3+noise(p*4.0+nt*0.5)*0.2;\n"
+    "    nebula*=(0.5+u_energy*1.2+u_beat*0.2);\n"
+    "    float neb_hue=mod(nebula*0.5+t*0.02,1.0);\n"
+    "    vec3 col=hsv2rgb(vec3(neb_hue,0.5+u_bass*0.2,clamp(nebula*0.7+0.05,0.0,1.0)));\n"
+    "    for(int layer=0;layer<4;layer++){float fl=float(layer);\n"
+    "        float wave=sin(uv01.x*5.0+t*0.3*(0.8+fl*0.2)+u_bass*2.0+fl*1.3)*0.5;\n"
+    "        float center=0.3+fl*0.12+wave*0.08;\n"
+    "        float band=exp(-(uv01.y-center)*(uv01.y-center)*50.0)*0.3;\n"
+    "        col+=hsv2rgb(vec3(mod(0.3+fl*0.1+t*0.02,1.0),0.7,1.0))*band*(0.4+u_energy*0.3);}\n"
+    "    vec2 nodes[6];\n"
+    "    for(int i=0;i<6;i++){float fi=float(i);\n"
+    "        nodes[i]=vec2(sin(fi*2.1+t*0.4)*0.7,cos(fi*1.5+t*0.35+fi*fi*0.2)*0.7);}\n"
+    "    for(int i=0;i<6;i++) for(int j=i+1;j<6;j++){\n"
+    "        float le=spec(float(i*6+j)/36.0); if(le<0.2) continue;\n"
+    "        vec2 a=nodes[i],b=nodes[j],ab=b-a; float abl=length(ab);\n"
+    "        vec2 abd=ab/(abl+0.001);\n"
+    "        float proj=clamp(dot(uv-a,abd),0.0,abl); vec2 cl=a+abd*proj;\n"
+    "        float jag=noise(vec2(proj*18.0+float(i+j)*5.0,t*5.0))*0.04*(1.0+u_beat);\n"
+    "        float d=abs(dot(uv-cl,vec2(-abd.y,abd.x)))-jag; d=max(d,0.0);\n"
+    "        col+=vec3(0.6,0.7,1.0)*0.003/(d+0.002)*le*(0.4+u_energy+u_beat*0.4);}\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+/* Fractal Vortex Inferno: fractal warp geometry + vortex spiral + fire colors */
+static const char *frag_fractalinferno =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float dist=length(uv)+0.001, ang=atan(uv.y,uv.x), t=u_time*0.3;\n"
+    "    float twist=t*2.5+(1.0/dist)*(1.0+u_bass*1.5+u_beat*0.5);\n"
+    "    float ta=ang+twist;\n"
+    "    vec2 p=vec2(cos(ta),sin(ta))*dist*3.0;\n"
+    "    for(int i=0;i<6;i++){p=abs(p)/dot(p,p)-vec2(1.0+u_bass*0.2,0.85+u_treble*0.15);\n"
+    "        float ca=cos(t*0.4+float(i)*0.5),sa=sin(t*0.4+float(i)*0.5);\n"
+    "        p=vec2(p.x*ca-p.y*sa,p.x*sa+p.y*ca);}\n"
+    "    float val=length(p)*(0.3+u_energy*0.7+u_beat*0.2);\n"
+    "    float spiral=sin(ta*4.0+dist*8.0)*0.5+0.5;\n"
+    "    float flame=clamp(val*spiral+exp(-dist*dist*6.0)*u_bass*0.4,0.0,1.0);\n"
+    "    vec3 col;\n"
+    "    if(flame<0.25) col=vec3(flame*3.0,0.0,flame*0.5);\n"
+    "    else if(flame<0.5){float g=(flame-0.25)*4.0;col=vec3(0.75+g*0.25,g*0.4,0.12*(1.0-g));}\n"
+    "    else if(flame<0.75){float g=(flame-0.5)*4.0;col=vec3(1.0,0.4+g*0.5,g*0.15);}\n"
+    "    else{float g=(flame-0.75)*4.0;col=vec3(1.0,0.9+g*0.1,0.15+g*0.7);}\n"
+    "    col+=hsv2rgb(vec3(mod(ta*0.1+t*0.05,1.0),0.6,0.06));\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+/* Crystal Galaxy: constellation stars + polyhedra 3D shapes + galaxy spiral arms */
+static const char *frag_crystalgalaxy =
+    "float sdBox2(vec3 p,vec3 b){vec3 d=abs(p)-b;return min(max(d.x,max(d.y,d.z)),0.0)+length(max(d,0.0));}\n"
+    "float sdOcta2(vec3 p,float s){p=abs(p);return(p.x+p.y+p.z-s)*0.57735;}\n"
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float dist=length(uv)+0.001,ang=atan(uv.y,uv.x),t=u_time*0.2;\n"
+    "    float spiral=sin(ang*2.0-log(dist)*4.0+t*3.0)*0.5+0.5;\n"
+    "    float arm=pow(spiral,2.0-u_bass)*0.4/(dist*2.0+0.3);\n"
+    "    float core=exp(-dist*dist*4.0)*(0.5+u_bass);\n"
+    "    float gh=mod(ang*0.159+dist*0.278+t*0.111,1.0);\n"
+    "    vec3 col=hsv2rgb(vec3(gh,0.5,clamp(arm+core*0.3,0.0,1.0)));\n"
+    "    float a1=t*2.5+u_bass,a2=t*1.5+u_treble;\n"
+    "    float ca=cos(a1),sa=sin(a1),cb=cos(a2),sb=sin(a2);\n"
+    "    vec3 ro=vec3(0,0,-3),rd=normalize(vec3(uv,1.5)); float tm=0.0,glow=0.0;\n"
+    "    for(int i=0;i<40;i++){vec3 p=ro+rd*tm;\n"
+    "        vec3 q=vec3(p.x*ca-p.z*sa,p.y*cb-(p.x*sa+p.z*ca)*sb,p.y*sb+(p.x*sa+p.z*ca)*cb);\n"
+    "        float sz=0.6+u_bass*0.2+u_beat*0.1;\n"
+    "        float d=min(abs(sdBox2(q,vec3(sz)))-0.01,abs(sdOcta2(q,sz*1.3))-0.01);\n"
+    "        glow+=0.004/(abs(d)+0.008); if(d<0.001) break; tm+=d; if(tm>8.0) break;}\n"
+    "    glow=clamp(glow*(0.2+u_energy*0.5+u_beat*0.2),0.0,1.0);\n"
+    "    col+=hsv2rgb(vec3(mod(t*0.06+glow*0.3,1.0),0.6,glow))*0.7;\n"
+    "    for(int i=0;i<40;i++){float fi=float(i);\n"
+    "        vec2 star=vec2(sin(fi*3.7+t*1.5)*1.1,cos(fi*2.3+t*1.25)*0.85);\n"
+    "        float sd=length(uv-star);\n"
+    "        float pulse=0.4+spec(mod(fi*3.0,64.0)/64.0)+u_beat*0.3;\n"
+    "        float twinkle=sin(fi*7.0+t*20.0)*0.4+0.6;\n"
+    "        col+=vec3(0.8,0.9,1.0)*0.006/(sd+0.003)*pulse*twinkle;}\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+/* Neon Pulse Grid: glitch digital + plasma color waves + shockwave expanding rings */
+static const char *frag_neonpulse =
+    "void main() {\n"
+    "    vec2 uv=gl_FragCoord.xy/u_resolution;\n"
+    "    vec2 cuv=(uv-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float t=u_time; float dist=length(cuv);\n"
+    "    float pv=(sin(uv.x*10.0+t*0.5+u_bass*5.0)+sin(uv.y*10.0+t*0.35+u_mid*3.0)\n"
+    "        +sin((uv.x+uv.y)*8.0+t*0.65)+sin(dist*12.0+t*0.45))*0.25;\n"
+    "    vec3 col=vec3(sin(pv*3.14159+u_energy*2.0)*0.5+0.5,\n"
+    "        sin(pv*3.14159+2.094+u_bass*3.0)*0.5+0.5,\n"
+    "        sin(pv*3.14159+4.188+u_treble*2.0)*0.5+0.5)*0.25;\n"
+    "    float glitch=hash(vec2(floor(uv.y*30.0),floor(t*8.0)));\n"
+    "    float offset=(glitch>0.75)?(glitch-0.75)*0.25*(u_bass+u_beat):0.0;\n"
+    "    float gx=mod(abs((uv.x+offset)*25.0+t*1.5),1.0);\n"
+    "    float gy=mod(abs(uv.y*25.0+t*0.4),1.0);\n"
+    "    float grid=(gx<0.04||gy<0.04)?0.6:0.0;\n"
+    "    float bar=spec(abs(uv.x+offset))*(1.0-uv.y);\n"
+    "    float gval=max(grid*u_energy*0.6,bar*0.5);\n"
+    "    col+=hsv2rgb(vec3(mod(0.45+bar*0.15+t*0.03,1.0),0.8,gval));\n"
+    "    for(int ring=0;ring<12;ring++){float fr=float(ring);\n"
+    "        float birth=fr*0.4+floor(t/0.4)*0.4; float age=t-birth;\n"
+    "        if(age<0.0||age>3.0) continue;\n"
+    "        float radius=age*(0.6+u_bass*0.4+u_beat*0.3);\n"
+    "        float thick=0.03+age*0.01; float rd=abs(dist-radius);\n"
+    "        float fade=1.0-age/3.0;\n"
+    "        col+=hsv2rgb(vec3(mod(0.8+fr*0.06+t*0.04,1.0),0.7,1.0))*fade*exp(-rd*rd/(thick*thick))*0.4*(0.5+u_energy);}\n"
+    "    col+=vec3(0.05,0.02,0.08);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+/* Cosmic Jellyfish: smoke FBM curl + rainbow bubbles + aurora curtains */
+static const char *frag_cosmicjellyfish =
+    "float fbm2(vec2 p){float v=0.0,a=0.5; for(int i=0;i<5;i++){v+=a*noise(p);p=p*2.1+vec2(1.7,9.2);a*=0.5;} return v;}\n"
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 uv01=gl_FragCoord.xy/u_resolution; float t=u_time;\n"
+    "    vec2 p=uv01*4.0;\n"
+    "    vec2 curl=vec2(fbm2(p+vec2(t*0.4,0)+u_bass*1.5),fbm2(p+vec2(0,t*0.4)+u_mid*0.8));\n"
+    "    float fluid=fbm2(p+curl*1.5+vec2(t*0.2,-t*0.15))+u_beat*0.2*fbm2(p*3.0+vec2(t*1.5));\n"
+    "    float fhue=mod(fluid*0.5+curl.x*0.3+t*0.04,1.0);\n"
+    "    vec3 col=hsv2rgb(vec3(fhue,0.5+u_energy*0.2,clamp(fluid*0.6+0.1,0.0,1.0)));\n"
+    "    for(int layer=0;layer<3;layer++){float fl=float(layer);\n"
+    "        float wave=sin(uv01.x*5.0+t*0.25+u_bass*2.0+fl*1.5)*0.5;\n"
+    "        float center=0.35+fl*0.12+wave*0.08;\n"
+    "        float band=exp(-(uv01.y-center)*(uv01.y-center)*45.0)*0.2;\n"
+    "        col+=hsv2rgb(vec3(mod(0.3+fl*0.12+t*0.02,1.0),0.65,1.0))*band*(0.4+u_energy*0.3);}\n"
+    "    for(int i=0;i<15;i++){float fi=float(i);\n"
+    "        float bh1=hash(vec2(fi*1.73,fi*0.91));\n"
+    "        float bh2=hash(vec2(fi*2.31,fi*1.57));\n"
+    "        float bh3=hash(vec2(fi*0.67,fi*3.13));\n"
+    "        float r=0.05+bh1*0.1+u_bass*0.015;\n"
+    "        float bx=(bh2*2.0-1.0)*1.0+sin(t*0.5+fi*2.7)*0.1;\n"
+    "        float by=mod(bh3*8.0+t*(0.1+bh1*0.2),3.0)-1.5;\n"
+    "        float d=length(uv-vec2(bx,by));\n"
+    "        if(d<r*1.2){\n"
+    "            float nd=d/r;\n"
+    "            float rim=smoothstep(0.7,1.0,nd)*smoothstep(1.1,0.95,nd);\n"
+    "            float film=nd*3.0+sin(atan(uv.y-by,uv.x-bx)*3.0+t*1.5)*0.5;\n"
+    "            float bhue=fract(film*0.3+fi*0.07+t*0.1+u_bass*0.2);\n"
+    "            vec3 bubble=hsv2rgb(vec3(bhue,0.6,0.7+rim*0.3))*rim*0.5;\n"
+    "            float sp=spec(mod(fi*4.0,64.0)/64.0);\n"
+    "            bubble*=(0.5+sp*0.5+u_energy*0.3);\n"
+    "            col+=bubble*smoothstep(r*1.1,r*0.8,d);\n"
+    "        }\n"
+    "        col+=vec3(0.5,0.6,0.8)*0.003/(abs(d-r)+0.003)*0.08;}\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
 static const char *get_frag_body(int preset) {
     switch(preset) {
         /* Audio Direct (0-2) */
@@ -1474,6 +1660,10 @@ static const char *get_frag_body(int preset) {
         /* Retro/Screensaver (40-45) */
         case 40:return frag_maze;case 41:return frag_3dmaze;case 42:return frag_matrixrain;
         case 43:return frag_flyingwindows;case 44:return frag_flyingwin98;case 45:return frag_rainbowbubbles;
+        /* Hybrid Mashups (46-51) */
+        case 46:return frag_spiralfractalwarp;case 47:return frag_nebulastorm;
+        case 48:return frag_fractalinferno;case 49:return frag_crystalgalaxy;
+        case 50:return frag_neonpulse;case 51:return frag_cosmicjellyfish;
         default:return frag_spectrum;
     }
 }
