@@ -292,7 +292,7 @@ static GLuint build_blend_program(vlc_object_t *obj) {
     return prog;
 }
 
-/* == FRAGMENT SHADERS == */
+/* == ALL 37 FRAGMENT SHADERS == */
 
 static const char *frag_spectrum =
     "void main() {\n"
@@ -592,61 +592,6 @@ static const char *frag_bluefire =
     "    else{float f=(flame-0.75)*4.0; col=vec3(0.2+f*0.8,0.5+f*0.5,1.0);}\n"
     "    gl_FragColor = vec4(col, 1.0);\n}\n";
 
-static const char *frag_fractalfire =
-    "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*1.6*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    vec2 c=vec2(-0.75+sin(u_time*0.2)*0.1,0.15+cos(u_time*0.15)*0.1+u_bass*0.08);\n"
-    "    vec2 z=uv; float iter=0.0;\n"
-    "    for(int i=0;i<48;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c;if(dot(z,z)>4.0)break;iter+=1.0;}\n"
-    "    float f=iter/48.0,flame=clamp(f*(1.0+u_energy+u_beat*0.5),0.0,1.0);\n"
-    "    vec3 col; if(flame<0.25) col=vec3(flame*4.0*0.7,0,0);\n"
-    "    else if(flame<0.5){float g=(flame-0.25)*4.0;col=vec3(0.7+g*0.3,g*0.5,0);}\n"
-    "    else if(flame<0.75){float g=(flame-0.5)*4.0;col=vec3(1,0.5+g*0.5,g*0.2);}\n"
-    "    else{float g=(flame-0.75)*4.0;col=vec3(1,1,0.2+g*0.8);}\n"
-    "    if(f>=1.0) col=vec3(0.08+u_bass*0.1,0.02,0.04+u_energy*0.05);\n"
-    "    gl_FragColor = vec4(col, 1.0);\n}\n";
-
-static const char *frag_infernotunnel =
-    "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*vec2(u_resolution.x/u_resolution.y,1.0);\n"
-    "    float dist=length(uv)+0.001, t=u_time*0.5, tunnel=1.0/dist;\n"
-    "    vec2 polar=vec2(tunnel, atan(uv.y,uv.x));\n"
-    "    float n1=noise(vec2(polar.y*1.5+sin(polar.y)*0.5+t, tunnel*2.0-t*2.5));\n"
-    "    float n2=noise(vec2(polar.y*3.0+cos(polar.y*2.0), tunnel*4.0-t*3.5))*0.5;\n"
-    "    float n3=noise(vec2(polar.y*0.8+t*0.5, tunnel*1.5+t*0.3))*0.3;\n"
-    "    float swirl=sin(tunnel*2.5-t*3.0+polar.y*2.0+sin(polar.y*3.0)*0.5)*0.5+0.5;\n"
-    "    float flame=clamp((n1+n2+n3)*swirl*(1.2+u_bass*1.5+u_beat*0.8)/(dist*2.5+0.2),0.0,1.0);\n"
-    "    float depth=1.0/(dist*3.0+0.3);\n"
-    "    vec3 hot=vec3(1.0,0.95,0.8);\n"
-    "    vec3 mid1=vec3(1.0,0.45,0.05);\n"
-    "    vec3 mid2=vec3(0.8,0.15,0.05);\n"
-    "    vec3 cool=vec3(0.5,0.08,0.15);\n"
-    "    vec3 col;\n"
-    "    if(flame<0.25) col=mix(cool,mid2,flame*4.0);\n"
-    "    else if(flame<0.5) col=mix(mid2,mid1,(flame-0.25)*4.0);\n"
-    "    else if(flame<0.75) col=mix(mid1,hot,(flame-0.5)*4.0);\n"
-    "    else col=mix(hot,vec3(1.0,1.0,0.9),(flame-0.75)*4.0);\n"
-    "    col*=(0.6+depth*0.8)*(1.0+u_energy*0.3);\n"
-    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
-
-static const char *frag_fireballs =
-    "void main() {\n"
-    "    vec2 uv=gl_FragCoord.xy/u_resolution; float aspect=u_resolution.x/u_resolution.y,t=u_time;\n"
-    "    vec3 col=vec3(0.01,0.005,0.02);\n"
-    "    for(int i=0;i<50;i++){float fi=float(i),phase=hash(vec2(fi*1.23,fi*0.77))*6.283;\n"
-    "        float speed=0.6+hash(vec2(fi*3.1,0.0))*1.2;\n"
-    "        float bx=fract(hash(vec2(fi,1.0))+t*speed*0.08);\n"
-    "        float bounce=abs(fract(t*speed*0.3+phase*0.5)*2.0-1.0);\n"
-    "        float by=0.05+bounce*0.9;\n"
-    "        vec2 diff=vec2((uv.x-bx)*aspect, uv.y-by);\n"
-    "        float d=dot(diff,diff);\n"
-    "        float bval=spec(mod(fi*2.0,64.0)/64.0);\n"
-    "        float sz=0.0015+u_energy*0.001+u_beat*0.001+bval*0.001;\n"
-    "        float brightness=sz/(d+0.00005)*(0.4+bval*0.6);\n"
-    "        float hue=mod(fi*0.031+t*0.05,1.0);\n"
-    "        col+=hsv2rgb(vec3(hue,0.8,1.0))*brightness;}\n"
-    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
-
 static const char *frag_diamonds =
     "void main() {\n"
     "    vec2 uv=gl_FragCoord.xy/u_resolution; float t=u_time; vec3 col=vec3(0.0);\n"
@@ -707,6 +652,29 @@ static const char *frag_polyhedra =
     "    col=max(col,bg);\n"
     "    gl_FragColor = vec4(col,1.0);\n}\n";
 
+static const char *frag_infernotunnel =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    float dist=length(uv)+0.001, t=u_time*0.5, tunnel=1.0/dist;\n"
+    "    vec2 polar=vec2(tunnel, atan(uv.y,uv.x));\n"
+    "    float n1=noise(vec2(polar.y*1.5+sin(polar.y)*0.5+t, tunnel*2.0-t*2.5));\n"
+    "    float n2=noise(vec2(polar.y*3.0+cos(polar.y*2.0), tunnel*4.0-t*3.5))*0.5;\n"
+    "    float n3=noise(vec2(polar.y*0.8+t*0.5, tunnel*1.5+t*0.3))*0.3;\n"
+    "    float swirl=sin(tunnel*2.5-t*3.0+polar.y*2.0+sin(polar.y*3.0)*0.5)*0.5+0.5;\n"
+    "    float flame=clamp((n1+n2+n3)*swirl*(1.2+u_bass*1.5+u_beat*0.8)/(dist*2.5+0.2),0.0,1.0);\n"
+    "    float depth=1.0/(dist*3.0+0.3);\n"
+    "    vec3 hot=vec3(1.0,0.95,0.8);\n"
+    "    vec3 mid1=vec3(1.0,0.45,0.05);\n"
+    "    vec3 mid2=vec3(0.8,0.15,0.05);\n"
+    "    vec3 cool=vec3(0.5,0.08,0.15);\n"
+    "    vec3 col;\n"
+    "    if(flame<0.25) col=mix(cool,mid2,flame*4.0);\n"
+    "    else if(flame<0.5) col=mix(mid2,mid1,(flame-0.25)*4.0);\n"
+    "    else if(flame<0.75) col=mix(mid1,hot,(flame-0.5)*4.0);\n"
+    "    else col=mix(hot,vec3(1.0,1.0,0.9),(flame-0.75)*4.0);\n"
+    "    col*=(0.6+depth*0.8)*(1.0+u_energy*0.3);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
 static const char *frag_galaxyripple =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
@@ -747,6 +715,38 @@ static const char *frag_plasmaaurora =
     "    vec3 col = hsv2rgb(vec3(hue, 0.7+u_beat*0.3, 1.0)) * beam * (1.0+u_energy+u_beat*0.5);\n"
     "    col += vec3(1.0,0.8,1.0) * core * 0.5;\n"
     "    col += hsv2rgb(vec3(mod(hue+0.3,1.0),0.5,1.0)) * noise(vec2(uv.x*30.0,t*10.0)) * 0.1 / (dist+0.03);\n"
+    "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
+static const char *frag_fractalfire =
+    "void main() {\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*1.6*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 c=vec2(-0.75+sin(u_time*0.2)*0.1,0.15+cos(u_time*0.15)*0.1+u_bass*0.08);\n"
+    "    vec2 z=uv; float iter=0.0;\n"
+    "    for(int i=0;i<48;i++){z=vec2(z.x*z.x-z.y*z.y,2.0*z.x*z.y)+c;if(dot(z,z)>4.0)break;iter+=1.0;}\n"
+    "    float f=iter/48.0,flame=clamp(f*(1.0+u_energy+u_beat*0.5),0.0,1.0);\n"
+    "    vec3 col; if(flame<0.25) col=vec3(flame*4.0*0.7,0,0);\n"
+    "    else if(flame<0.5){float g=(flame-0.25)*4.0;col=vec3(0.7+g*0.3,g*0.5,0);}\n"
+    "    else if(flame<0.75){float g=(flame-0.5)*4.0;col=vec3(1,0.5+g*0.5,g*0.2);}\n"
+    "    else{float g=(flame-0.75)*4.0;col=vec3(1,1,0.2+g*0.8);}\n"
+    "    if(f>=1.0) col=vec3(0.08+u_bass*0.1,0.02,0.04+u_energy*0.05);\n"
+    "    gl_FragColor = vec4(col, 1.0);\n}\n";
+
+static const char *frag_fireballs =
+    "void main() {\n"
+    "    vec2 uv=gl_FragCoord.xy/u_resolution; float aspect=u_resolution.x/u_resolution.y,t=u_time;\n"
+    "    vec3 col=vec3(0.01,0.005,0.02);\n"
+    "    for(int i=0;i<50;i++){float fi=float(i),phase=hash(vec2(fi*1.23,fi*0.77))*6.283;\n"
+    "        float speed=0.6+hash(vec2(fi*3.1,0.0))*1.2;\n"
+    "        float bx=fract(hash(vec2(fi,1.0))+t*speed*0.08);\n"
+    "        float bounce=abs(fract(t*speed*0.3+phase*0.5)*2.0-1.0);\n"
+    "        float by=0.05+bounce*0.9;\n"
+    "        vec2 diff=vec2((uv.x-bx)*aspect, uv.y-by);\n"
+    "        float d=dot(diff,diff);\n"
+    "        float bval=spec(mod(fi*2.0,64.0)/64.0);\n"
+    "        float sz=0.0015+u_energy*0.001+u_beat*0.001+bval*0.001;\n"
+    "        float brightness=sz/(d+0.00005)*(0.4+bval*0.6);\n"
+    "        float hue=mod(fi*0.031+t*0.05,1.0);\n"
+    "        col+=hsv2rgb(vec3(hue,0.8,1.0))*brightness;}\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_shockwave =
@@ -922,7 +922,6 @@ static const char *frag_angularkaleidoscope =
     "    pattern*=(0.5+ripple*0.5)*(1.0+u_energy+u_beat*0.3);\n"
     "    float hue=mod(dist*0.3+angle*0.1+t*0.1+pattern*0.2,1.0);\n"
     "    gl_FragColor = vec4(hsv2rgb(vec3(hue,0.85,clamp(pattern,0.0,1.0))),1.0);\n}\n";
-
 
 static const char *frag_maze =
     "void main() {\n"
@@ -1136,6 +1135,7 @@ static const char *frag_rainbowbubbles =
     "    col+=vec3(0.05,0.04,0.08)*(1.0-length(uv)*0.2);\n"
     "    col+=vec3(0.9,0.85,1.0)*u_beat*0.04;\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
+
 static const char *get_frag_body(int preset) {
     switch(preset) {
         case 0:return frag_spectrum;case 1:return frag_wave;case 2:return frag_circular;
@@ -1496,9 +1496,8 @@ static void *Thread(void *p_data) {
             } else {
                 p->preset = (p->preset + kd + NUM_PRESETS) % NUM_PRESETS;
                 p->preset_time = 0;
-                p->user_preset = p->preset + 1; /* switch to manual mode */
+                p->user_preset = p->preset + 1;
             }
-            /* Write back to config so Lua panel can pick it up */
             config_PutInt(p->p_obj, "auraviz-preset", p->user_preset);
         }
         if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS) {
