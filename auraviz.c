@@ -797,14 +797,16 @@ static const char *frag_dna =
     "        for(int helix=0;helix<2;helix++){\n"
     "            float ph=float(helix)*3.14159;\n"
     "            float scroll=rl.y*8.0+t*speed+fs*2.0;\n"
-    "            float sx=sin(scroll+ph)*0.18*(1.0+u_bass*0.4);\n"
+    "            float sx=sin(scroll+ph)*0.22*(1.0+u_bass*0.4);\n"
     "            float sz=cos(scroll+ph)*0.5+0.5;\n"
-    "            float thick=0.012+sz*0.008;\n"
+    "            float thick=0.025+sz*0.015;\n"
     "            float dx=abs(rl.x-sx);\n"
     "            float glow=thick/(dx*dx+thick)*sz;\n"
-    "            float fade=1.0/(1.0+length(local)*2.0);\n"
+    "            float depth3d=0.3+sz*0.7;\n"
+    "            float fade=1.0/(1.0+length(local)*1.5);\n"
     "            float hue=mod(fs*0.2+t*0.08+u_beat*0.2,1.0);\n"
-    "            col+=hsv2rgb(vec3(hue,0.8,1.0))*glow*0.3*fade*(0.5+u_energy);\n"
+    "            col+=hsv2rgb(vec3(hue,0.7,depth3d))*glow*0.5*fade*(0.6+u_energy);\n"
+    "            col+=vec3(0.9,0.95,1.0)*pow(max(0.0,1.0-dx/thick*2.0),3.0)*sz*0.15*fade;\n"
     "            if(helix==0 && mod(scroll,1.5)<0.15){\n"
     "                float sx2=sin(scroll+3.14159+ph)*0.18*(1.0+u_bass*0.4);\n"
     "                float rung=step(min(sx,sx2),rl.x)*step(rl.x,max(sx,sx2))*0.15*sz;\n"
@@ -889,21 +891,21 @@ static const char *frag_helixparticles =
     "void main() {\n"
     "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
     "    float t=u_time; vec3 col=vec3(0.01,0.005,0.02);\n"
-    "    for(int i=0;i<80;i++){\n"
+    "    for(int i=0;i<200;i++){\n"
     "        float fi=float(i), phase=hash(vec2(fi*0.73,fi*1.31))*6.283;\n"
-    "        float orbit_r=0.2+hash(vec2(fi*2.1,fi*0.5))*0.7;\n"
-    "        float speed=1.0+hash(vec2(fi*1.7,0.0))*3.0;\n"
-    "        float vert=sin(t*speed*0.3+phase)*0.8;\n"
-    "        float helix_angle=t*speed+phase+fi*0.5;\n"
+    "        float orbit_r=0.15+hash(vec2(fi*2.1,fi*0.5))*0.8;\n"
+    "        float speed=0.8+hash(vec2(fi*1.7,0.0))*2.5;\n"
+    "        float vert=sin(t*speed*0.3+phase)*0.9;\n"
+    "        float helix_angle=t*speed+phase+fi*0.3;\n"
     "        float px=orbit_r*cos(helix_angle)+sin(t*0.5+fi)*0.1;\n"
     "        float py=vert+orbit_r*sin(helix_angle)*0.3;\n"
     "        vec2 diff=uv-vec2(px,py);\n"
     "        float d=length(diff);\n"
     "        float bval=spec(mod(fi*2.5,64.0)/64.0);\n"
-    "        float sz=0.008+bval*0.01+u_beat*0.005;\n"
-    "        float glow=sz/(d*d+sz*0.05);\n"
-    "        float hue=mod(fi*0.013+t*0.08+vert*0.2,1.0);\n"
-    "        col+=hsv2rgb(vec3(hue,0.7,1.0))*glow*0.12*(0.5+u_energy);\n"
+    "        float sz=0.004+u_beat*0.002;\n"
+    "        float glow=sz/(d*d+sz*0.03);\n"
+    "        float hue=mod(fi*0.005+t*0.06+vert*0.15,1.0);\n"
+    "        col+=hsv2rgb(vec3(hue,0.8,0.8))*glow*0.04*(0.5+u_energy+bval*0.3);\n"
     "    }\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
@@ -983,7 +985,7 @@ static const char *frag_matrixrain =
     "void main() {\n"
     "    vec2 uv=gl_FragCoord.xy/u_resolution;\n"
     "    float t=u_time;\n"
-    "    float cols=40.0;\n"
+    "    float cols=30.0+u_bass*10.0;\n"
     "    float rows=cols*(u_resolution.y/u_resolution.x);\n"
     "    float col_id=floor(uv.x*cols);\n"
     "    float col_hash=hash(vec2(col_id*0.773,col_id*1.31));\n"
@@ -1007,7 +1009,8 @@ static const char *frag_matrixrain =
     "    float glow=exp(-abs(uv.x-((col_id+0.5)/cols))*cols*1.5)*fade*0.08*(1.0+u_energy);\n"
     "    col3+=vec3(0.05,0.2,0.08)*glow;\n"
     "    col3*=(0.6+col_spec*0.8);\n"
-    "    col3+=vec3(0.05,0.15,0.05)*u_beat*0.3;\n"
+    "    col3+=vec3(0.05,0.15,0.05)*u_beat*0.5;\n"
+    "    col3*=1.0+u_beat*0.3;\n"
     "    gl_FragColor = vec4(clamp(col3,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_asteroidfield =
@@ -1019,7 +1022,7 @@ static const char *frag_asteroidfield =
     "    for(int s=0;s<80;s++){\n"
     "        float fs=float(s);\n"
     "        float sz=fract(hash(vec2(fs*1.1,fs*2.3))+t*fly_speed*0.15);\n"
-    "        float scale=1.0/(sz*4.0+0.05);\n"
+    "        float scale=1.0/((1.0-sz)*4.0+0.05);\n"
     "        vec2 sp=vec2(hash(vec2(fs,1.0))*2.0-1.0,hash(vec2(1.0,fs))*2.0-1.0)*scale*0.4;\n"
     "        float sd=length(uv-sp);\n"
     "        float sfade=smoothstep(0.0,0.1,sz)*smoothstep(1.0,0.8,sz);\n"
@@ -1034,7 +1037,7 @@ static const char *frag_asteroidfield =
     "        for(int i=0;i<8;i++){\n"
     "            float fi=float(i)+fl*8.0;\n"
     "            float z=fract(hash(vec2(fi*1.73,fl*3.17))+t*fly_speed*(0.08+fl*0.04));\n"
-    "            float scale2=1.0/(z*3.0+0.1);\n"
+    "            float scale2=1.0/((1.0-z)*3.0+0.1);\n"
     "            float ax=hash(vec2(fi*1.73,fl*3.17))*2.0-1.0;\n"
     "            float ay=hash(vec2(fi*2.31,fl*1.93))*2.0-1.0;\n"
     "            vec2 center=vec2(ax,ay)*scale2*0.4;\n"
@@ -1169,68 +1172,73 @@ static const char *frag_rainbowbubbles =
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_3dmaze =
+    "float maze_wall(vec2 cell) {\n"
+    "    return step(0.45,hash(floor(cell)*0.37+vec2(0.1,0.2)));\n"
+    "}\n"
     "void main() {\n"
-    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0*vec2(u_resolution.x/u_resolution.y,1.0);\n"
+    "    vec2 uv=(gl_FragCoord.xy/u_resolution-0.5)*2.0;\n"
+    "    uv.x*=u_resolution.x/u_resolution.y;\n"
     "    float t=u_time;\n"
-    "    float move_speed=0.3+u_energy*0.4+u_beat*0.3;\n"
-    "    float cam_x=t*move_speed;\n"
-    "    float cam_z=t*move_speed*0.7+sin(t*0.2)*2.0;\n"
-    "    float turn=sin(t*0.15)*0.3+cos(t*0.23)*0.2;\n"
-    "    vec2 dir=vec2(cos(turn),sin(turn));\n"
+    "    float spd=0.5+u_energy*0.5+u_beat*0.3;\n"
+    "    float px=t*spd*0.4;\n"
+    "    float pz=t*spd*0.3;\n"
+    "    float ang=sin(t*0.12)*0.6+cos(t*0.19)*0.4;\n"
+    "    vec3 ro=vec3(px,0.0,pz);\n"
+    "    vec3 fw=normalize(vec3(cos(ang),0.0,sin(ang)));\n"
+    "    vec3 rt=vec3(-fw.z,0.0,fw.x);\n"
+    "    vec3 up=vec3(0.0,1.0,0.0);\n"
+    "    vec3 rd=normalize(fw+uv.x*rt*0.8+uv.y*up*0.8);\n"
     "    vec3 col=vec3(0.0);\n"
-    "    for(int i=1;i<30;i++){\n"
-    "        float fi=float(i);\n"
-    "        float depth=fi*0.4;\n"
-    "        float fade=1.0/(1.0+depth*depth*0.08);\n"
-    "        vec2 world=vec2(cam_x,cam_z)+dir*depth;\n"
-    "        vec2 cell=floor(world);\n"
-    "        vec2 frc=fract(world);\n"
-    "        float h_wall=step(0.5,hash(cell*0.37));\n"
-    "        float v_wall=step(0.5,hash(cell*0.61+vec2(0.5,0.5)));\n"
-    "        float persp=1.0/(depth+0.5);\n"
-    "        float hw=0.9*persp;\n"
-    "        float hh=0.7*persp;\n"
-    "        float floor_y=-hh+hh*0.3;\n"
-    "        float ceil_y=hh-hh*0.3;\n"
-    "        float flr=smoothstep(floor_y,floor_y+0.02,uv.y)*smoothstep(-1.0,-0.8,uv.y);\n"
-    "        float flr_d=abs(uv.y-floor_y);\n"
-    "        float ceil_d=abs(uv.y-ceil_y);\n"
-    "        if(h_wall>0.5 && abs(frc.x-0.5)<0.1){\n"
-    "            float wall_x=((frc.y-0.5)/depth)*2.0;\n"
-    "            if(abs(uv.x-wall_x)<persp*0.5 && uv.y>floor_y && uv.y<ceil_y){\n"
-    "                float brick_u=fract(wall_x*3.0+cell.x);\n"
-    "                float brick_v=fract((uv.y-floor_y)/(ceil_y-floor_y)*4.0);\n"
-    "                float brick=step(0.05,brick_u)*step(brick_u,0.95)*step(0.05,brick_v)*step(brick_v,0.95);\n"
-    "                float sp=spec(mod(fi*2.0,64.0)/64.0);\n"
-    "                float shade=0.4+0.3*brick+sp*0.3;\n"
-    "                vec3 wall_col=vec3(0.6,0.2,0.15)*shade*fade;\n"
-    "                wall_col+=vec3(0.3,0.1,0.05)*u_bass*0.3*fade;\n"
-    "                col=max(col,wall_col);\n"
-    "            }\n"
+    "    float total_d=0.0;\n"
+    "    bool hit=false;\n"
+    "    vec3 hit_n=vec3(0.0);\n"
+    "    vec3 hit_p=vec3(0.0);\n"
+    "    for(int i=0;i<60;i++){\n"
+    "        vec3 p=ro+rd*total_d;\n"
+    "        float cy=min(abs(p.y-0.5),abs(p.y+0.5));\n"
+    "        vec2 cell=vec2(p.x,p.z);\n"
+    "        vec2 fc=fract(cell);\n"
+    "        float wx=abs(fc.x-0.5)-0.42;\n"
+    "        float wz=abs(fc.y-0.5)-0.42;\n"
+    "        float wall_d=1.0;\n"
+    "        if(maze_wall(cell)>0.5){\n"
+    "            wall_d=min(wall_d,max(-wx,-wz));\n"
     "        }\n"
-    "        if(v_wall>0.5 && abs(frc.y-0.5)<0.1){\n"
-    "            float wall_x2=((frc.x-0.5)/depth)*2.0;\n"
-    "            if(abs(uv.x-wall_x2)<persp*0.5 && uv.y>floor_y && uv.y<ceil_y){\n"
-    "                float shade2=0.35+hash(cell+vec2(1.0,0.0))*0.15;\n"
-    "                float sp2=spec(mod(fi*3.0+7.0,64.0)/64.0);\n"
-    "                vec3 wall_col2=vec3(0.55,0.18,0.12)*shade2*fade;\n"
-    "                wall_col2+=vec3(0.2,0.08,0.03)*sp2*0.4*fade;\n"
-    "                col=max(col,wall_col2);\n"
-    "            }\n"
-    "        }\n"
-    "        if(uv.y<floor_y+0.01 && uv.y>floor_y-0.3*persp){\n"
-    "            float tile=fract(world.x*2.0)*fract(world.y*2.0);\n"
-    "            float flr_shade=(0.15+tile*0.1)*fade;\n"
-    "            col=max(col,vec3(0.3,0.25,0.15)*flr_shade);\n"
-    "        }\n"
-    "        if(uv.y>ceil_y-0.01 && uv.y<ceil_y+0.3*persp){\n"
-    "            float ceil_shade=0.1*fade;\n"
-    "            col=max(col,vec3(0.2,0.2,0.25)*ceil_shade);\n"
-    "        }\n"
+    "        if(maze_wall(cell+vec2(1.0,0.0))>0.5) wall_d=min(wall_d,abs(fc.x-0.95));\n"
+    "        if(maze_wall(cell+vec2(0.0,1.0))>0.5) wall_d=min(wall_d,abs(fc.y-0.95));\n"
+    "        float d=min(cy,wall_d)*0.5;\n"
+    "        d=max(d,0.005);\n"
+    "        total_d+=d;\n"
+    "        if(d<0.01){hit=true;hit_p=p;\n"
+    "            if(cy<wall_d) hit_n=vec3(0.0,sign(p.y),0.0);\n"
+    "            else if(abs(wx)<abs(wz)) hit_n=vec3(sign(fc.x-0.5),0.0,0.0);\n"
+    "            else hit_n=vec3(0.0,0.0,sign(fc.y-0.5));\n"
+    "            break;}\n"
+    "        if(total_d>20.0) break;\n"
     "    }\n"
-    "    float fog=exp(-length(uv)*0.5);\n"
-    "    col*=0.7+fog*0.3;\n"
-    "    col+=vec3(0.4,0.2,0.15)*u_beat*0.06;\n"
+    "    if(hit){\n"
+    "        float fog=exp(-total_d*0.15);\n"
+    "        float light=0.3+0.7*max(0.0,dot(hit_n,normalize(vec3(0.5,1.0,0.3))));\n"
+    "        float sp=spec(mod(total_d*2.0,64.0)/64.0);\n"
+    "        if(abs(hit_n.y)>0.5){\n"
+    "            vec2 tile=fract(vec2(hit_p.x,hit_p.z)*2.0);\n"
+    "            float checker=step(0.5,tile.x)*step(0.5,tile.y)+(1.0-step(0.5,tile.x))*(1.0-step(0.5,tile.y));\n"
+    "            if(hit_n.y>0.0) col=mix(vec3(0.3,0.25,0.15),vec3(0.4,0.35,0.2),checker)*light*fog;\n"
+    "            else col=vec3(0.2,0.2,0.25)*light*fog*(0.6+checker*0.2);\n"
+    "        } else {\n"
+    "            vec2 bp=abs(hit_n.x)>0.5?vec2(hit_p.z,hit_p.y):vec2(hit_p.x,hit_p.y);\n"
+    "            vec2 brick=fract(bp*vec2(3.0,4.0)+vec2(0.0,step(0.5,fract(bp.y*2.0))*0.5));\n"
+    "            float bline=step(brick.x,0.05)+step(brick.y,0.07);\n"
+    "            bline=clamp(bline,0.0,1.0);\n"
+    "            vec3 brick_col=mix(vec3(0.6,0.2,0.12),vec3(0.45,0.42,0.35),bline);\n"
+    "            brick_col+=vec3(0.1,0.05,0.02)*sp;\n"
+    "            col=brick_col*light*fog;\n"
+    "        }\n"
+    "        col+=vec3(0.3,0.15,0.1)*u_bass*0.2*fog;\n"
+    "        col+=vec3(0.2,0.1,0.05)*u_beat*0.15*fog;\n"
+    "    } else {\n"
+    "        col=vec3(0.02,0.02,0.05);\n"
+    "    }\n"
     "    gl_FragColor = vec4(clamp(col,0.0,1.0), 1.0);\n}\n";
 
 static const char *frag_flyingwin98 =
@@ -1239,10 +1247,10 @@ static const char *frag_flyingwin98 =
     "    float t=u_time;\n"
     "    vec3 col=vec3(0.0,0.0,0.02);\n"
     "    float fly_speed=0.15+u_energy*0.2+u_beat*0.1;\n"
-    "    for(int i=0;i<40;i++){\n"
+    "    for(int i=0;i<60;i++){\n"
     "        float fi=float(i);\n"
     "        float z=fract(hash(vec2(fi*1.37,fi*0.91))+t*fly_speed*(0.15+hash(vec2(fi*2.1,0.0))*0.35));\n"
-    "        float scale=z*z*3.0+0.01;\n"
+    "        float scale=z*z*4.0+0.02;\n"
     "        float ox=(hash(vec2(fi,1.0))*2.0-1.0)*0.3;\n"
     "        float oy=(hash(vec2(1.0,fi))*2.0-1.0)*0.3;\n"
     "        vec2 center=vec2(ox,oy)*scale;\n"
@@ -1285,22 +1293,32 @@ static const char *frag_flyingwin98 =
 
 static const char *get_frag_body(int preset) {
     switch(preset) {
+        /* Audio Direct (0-2) */
         case 0:return frag_spectrum;case 1:return frag_wave;case 2:return frag_circular;
-        case 3:return frag_particles;case 4:return frag_nebula;case 5:return frag_plasma;
-        case 6:return frag_tunnel;case 7:return frag_kaleidoscope;case 8:return frag_lava;
-        case 9:return frag_starburst;case 10:return frag_storm;case 11:return frag_ripple;
-        case 12:return frag_fractalwarp;case 13:return frag_galaxy;case 14:return frag_glitch;
-        case 15:return frag_aurora;case 16:return frag_fire;case 17:return frag_greenfire;
-        case 18:return frag_bluefire;case 19:return frag_fractalfire;case 20:return frag_infernotunnel;
-        case 21:return frag_fireballs;case 22:return frag_diamonds;case 23:return frag_vortex;
-        case 24:return frag_julia;case 25:return frag_smoke;case 26:return frag_polyhedra;
-        case 27:return frag_galaxyripple;case 28:return frag_stormvortex;case 29:return frag_plasmaaurora;
-        case 30:return frag_shockwave;case 31:return frag_dna;case 32:return frag_lightningweb;
-        case 33:return frag_constellation;case 34:return frag_lightningweb2;case 35:return frag_helixparticles;
-        case 36:return frag_radialkaleidoscope;case 37:return frag_angularkaleidoscope;
-        case 38:return frag_maze;case 39:return frag_matrixrain;case 40:return frag_asteroidfield;
-        case 41:return frag_flyingwindows;case 42:return frag_rainbowbubbles;
-        case 43:return frag_3dmaze;case 44:return frag_flyingwin98;
+        /* Space/Particles (3-7) */
+        case 3:return frag_particles;case 4:return frag_nebula;case 5:return frag_constellation;
+        case 6:return frag_galaxyripple;case 7:return frag_asteroidfield;
+        /* Kaleidoscope (8-10) */
+        case 8:return frag_kaleidoscope;case 9:return frag_radialkaleidoscope;case 10:return frag_angularkaleidoscope;
+        /* Patterns/Fractals (11-16) */
+        case 11:return frag_plasma;case 12:return frag_tunnel;case 13:return frag_lava;
+        case 14:return frag_fractalwarp;case 15:return frag_julia;case 16:return frag_glitch;
+        /* Fire (17-22) */
+        case 17:return frag_fire;case 18:return frag_greenfire;case 19:return frag_bluefire;
+        case 20:return frag_fractalfire;case 21:return frag_infernotunnel;case 22:return frag_fireballs;
+        /* Energy/Storm/Lightning (23-29) */
+        case 23:return frag_starburst;case 24:return frag_storm;case 25:return frag_stormvortex;
+        case 26:return frag_shockwave;case 27:return frag_lightningweb;case 28:return frag_lightningweb2;
+        case 29:return frag_plasmaaurora;
+        /* Motion/Flow (30-36) */
+        case 30:return frag_vortex;case 31:return frag_galaxy;case 32:return frag_ripple;
+        case 33:return frag_diamonds;case 34:return frag_smoke;case 35:return frag_aurora;
+        case 36:return frag_polyhedra;
+        /* DNA/Helix (37-38) */
+        case 37:return frag_dna;case 38:return frag_helixparticles;
+        /* Retro/Screensaver (39-44) */
+        case 39:return frag_maze;case 40:return frag_3dmaze;case 41:return frag_matrixrain;
+        case 42:return frag_flyingwindows;case 43:return frag_flyingwin98;case 44:return frag_rainbowbubbles;
         default:return frag_spectrum;
     }
 }
