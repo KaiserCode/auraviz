@@ -1869,35 +1869,58 @@ static void set_window_icon(HWND hwnd) {
 
 static void toggle_fullscreen(HWND hwnd) {
     DWORD style = GetWindowLong(hwnd, GWL_STYLE);
-    g_fs_transition = true; /* prevent WM_WINDOWPOSCHANGING from blocking */
+    DWORD exstyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+    g_fs_transition = true;
+
     if (!g_fullscreen) {
         /* --- ENTERING FULLSCREEN --- */
-        /* Step 1: Remove always-on-top BEFORE changing window style/size.
-           This prevents the TOPMOST z-order from conflicting with the
-           fullscreen window position change, which causes freezes. */
-        if (g_ontop) {
+
+        /* Step 1: Strip WS_EX_TOPMOST from the extended style bits directly.
+           This must happen BEFORE any SetWindowPos calls to avoid the OS
+           fighting between the TOPMOST ex-style and the z-order change. */
+        if (exstyle & WS_EX_TOPMOST) {
+            SetWindowLong(hwnd, GWL_EXSTYLE, exstyle & ~WS_EX_TOPMOST);
+            /* Flush the style change through the system */
             SetWindowPos(hwnd, HWND_NOTOPMOST,
-                         0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            g_ontop = false;
+                         0, 0, 0, 0,
+                         SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_FRAMECHANGED);
         }
+        g_ontop = false;
+
+        /* Pump any pending messages so the z-order change completes
+           before we resize to fullscreen */
+        MSG m;
+        while (PeekMessage(&m, hwnd, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessage(&m);
+        }
+
         /* Step 2: Save placement and go fullscreen */
         MONITORINFO mi = { sizeof(mi) };
         if (GetWindowPlacement(hwnd, &g_wp_prev) &&
             GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
             SetWindowLong(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
             SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right-mi.rcMonitor.left, mi.rcMonitor.bottom-mi.rcMonitor.top,
-                         SWP_FRAMECHANGED|SWP_NOACTIVATE);
+                         mi.rcMonitor.right-mi.rcMonitor.left,
+                         mi.rcMonitor.bottom-mi.rcMonitor.top,
+                         SWP_FRAMECHANGED);
         }
         g_fullscreen = true;
     } else {
         /* --- EXITING FULLSCREEN --- */
         SetWindowLong(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_wp_prev);
+
         /* Restore always-on-top only if user had it enabled */
-        HWND insert_after = g_ontop_user_enabled ? HWND_TOPMOST : HWND_NOTOPMOST;
-        SetWindowPos(hwnd, insert_after,
-                     0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_FRAMECHANGED);
+        if (g_ontop_user_enabled) {
+            DWORD ex = GetWindowLong(hwnd, GWL_EXSTYLE);
+            SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_TOPMOST);
+            SetWindowPos(hwnd, HWND_TOPMOST,
+                         0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_FRAMECHANGED);
+        } else {
+            SetWindowPos(hwnd, HWND_NOTOPMOST,
+                         0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_FRAMECHANGED);
+        }
         g_ontop = g_ontop_user_enabled;
         g_fullscreen = false;
     }
@@ -1907,11 +1930,12 @@ static void toggle_fullscreen(HWND hwnd) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_WINDOWPOSCHANGING: {
-            if (g_lock_position && !g_fs_transition) {
+            if (g_lock_position && !g_fs_transition && !g_fullscreen) {
                 WINDOWPOS *pos = (WINDOWPOS *)lp;
                 pos->flags |= SWP_NOMOVE | SWP_NOSIZE;
             }
-            return 0;
+            /* MUST fall through to DefWindowProc for proper z-order handling */
+            break;
         }
         case WM_SIZE: {
             int w=LOWORD(lp),h=HIWORD(lp);
