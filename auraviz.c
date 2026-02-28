@@ -75,6 +75,8 @@ change_integer_range(0, 100)
 add_bool("auraviz-ontop", true, "Always on top", "Keep visualization window above other windows", false)
 add_bool("auraviz-meta", true, "Show song info", "Display artist and title overlay on song change", false)
 add_string("auraviz-meta-text", "", "Metadata text", "Song info text set by Lua extension", false)
+add_bool("auraviz-lyrics", true, "Show lyrics", "Display synced lyrics from LRC files", false)
+add_string("auraviz-lyric-data", "", "Lyric data", "Serialized LRC data from Lua extension", false)
 set_callbacks(Open, Close)
 add_shortcut("auraviz")
 vlc_module_end()
@@ -5202,6 +5204,37 @@ static GLuint g_meta_texture = 0;
 static int g_meta_tex_w = 0, g_meta_tex_h = 0;
 static bool g_meta_tex_valid = false;
 
+/* == Lyrics Overlay (Enhanced LRC) == */
+#define LRC_MAX_LINES 500
+#define LRC_MAX_WORDS 30
+#define LRC_WORD_MAX  64
+
+typedef struct {
+	float time;                        /* word start time in seconds */
+	wchar_t text[LRC_WORD_MAX];
+	int pixel_x;                       /* rendered X offset in texture (filled during texture creation) */
+	int pixel_w;                       /* rendered width in pixels */
+} lrc_word_t;
+
+typedef struct {
+	float time;                        /* line start time */
+	lrc_word_t words[LRC_MAX_WORDS];
+	int word_count;
+	wchar_t full_text[META_MAX];       /* full line text for rendering */
+} lrc_line_t;
+
+static lrc_line_t g_lrc_lines[LRC_MAX_LINES];
+static int g_lrc_line_count = 0;
+static bool g_lrc_loaded = false;
+static char g_lrc_last_data[64] = "";  /* hash to detect config change */
+static int g_lrc_cur_line = -1;        /* current active line index */
+static float g_lrc_line_fade = 0.0f;   /* fade timer for line transitions */
+static GLuint g_lrc_texture = 0;
+static int g_lrc_tex_w = 0, g_lrc_tex_h = 0;
+static bool g_lrc_tex_valid = false;
+static int g_lrc_tex_line = -1;        /* which line the texture was built for */
+#define LRC_FADE_DURATION 0.3f
+
 /* Create a 32x32 RGBA icon programmatically (spectrum circle design) */
 static HICON create_auraviz_icon(void) {
 	const int S = 32;
@@ -5602,11 +5635,311 @@ static void render_meta_overlay(int screen_w, int screen_h) {
 
 	glColor4f(1.0f, 1.0f, 1.0f, alpha);
 	glBegin(GL_QUADS);
-		glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y0);
-		glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y0);
-		glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y1);
-		glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y1);
+		glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y0);
+		glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y0);
+		glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y1);
 	glEnd();
+
+	glDisable(GL_TEXTURE_2D);
+	glDisable(GL_BLEND);
+	glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+/* == LRC Lyrics Parsing and Rendering == */
+
+/* Parse time string "MM:SS.CC" to float seconds */
+static float parse_lrc_time(const char *s) {
+	int min = 0, sec = 0, cs = 0;
+	if (sscanf(s, "%d:%d.%d", &min, &sec, &cs) >= 2)
+		return (float)min * 60.0f + (float)sec + (float)cs / 100.0f;
+	return 0.0f;
+}
+
+/* Parse serialized LRC data from Lua.
+   Format: "LINE_TIME|WORD_TIME WORD WORD_TIME WORD ...\nLINE_TIME|...\n"
+   Each line: "[MM:SS.CC]|<MM:SS.CC> word <MM:SS.CC> word ..."
+*/
+static void parse_lrc_data(const char *data) {
+	g_lrc_line_count = 0;
+	if (!data || !data[0]) { g_lrc_loaded = false; return; }
+
+	const char *p = data;
+	while (*p && g_lrc_line_count < LRC_MAX_LINES) {
+		lrc_line_t *line = &g_lrc_lines[g_lrc_line_count];
+		memset(line, 0, sizeof(*line));
+
+		/* Parse line time: "SS.CC|" */
+		char *pipe = strchr(p, '|');
+		if (!pipe) break;
+		char time_buf[32];
+		int tlen = (int)(pipe - p);
+		if (tlen > 31) tlen = 31;
+		memcpy(time_buf, p, tlen); time_buf[tlen] = 0;
+		line->time = (float)atof(time_buf);
+		p = pipe + 1;
+
+		/* Parse words: "TIME WORD TIME WORD ..." until newline */
+		int wc = 0;
+		wchar_t full[META_MAX] = L"";
+		int full_len = 0;
+		while (*p && *p != '\n' && wc < LRC_MAX_WORDS) {
+			/* Skip whitespace */
+			while (*p == ' ') p++;
+			if (!*p || *p == '\n') break;
+
+			/* Parse word time */
+			char wtime[32];
+			int wi = 0;
+			while (*p && *p != ' ' && *p != '\n' && wi < 31) wtime[wi++] = *p++;
+			wtime[wi] = 0;
+			float wt = (float)atof(wtime);
+
+			/* Skip space */
+			while (*p == ' ') p++;
+
+			/* Parse word text */
+			char word[LRC_WORD_MAX * 2] = "";
+			wi = 0;
+			while (*p && *p != '\n') {
+				/* Stop at next timestamp (digit after space) */
+				if (*p == ' ') {
+					const char *ahead = p + 1;
+					while (*ahead == ' ') ahead++;
+					if (*ahead >= '0' && *ahead <= '9') break;
+				}
+				if (wi < (int)sizeof(word)-1) word[wi++] = *p;
+				p++;
+			}
+			word[wi] = 0;
+			/* Trim trailing spaces */
+			while (wi > 0 && word[wi-1] == ' ') word[--wi] = 0;
+
+			if (word[0]) {
+				line->words[wc].time = wt;
+				MultiByteToWideChar(CP_UTF8, 0, word, -1, line->words[wc].text, LRC_WORD_MAX);
+				/* Append to full text */
+				if (full_len > 0 && full_len < META_MAX - 2) full[full_len++] = L' ';
+				int wlen = (int)wcslen(line->words[wc].text);
+				for (int i = 0; i < wlen && full_len < META_MAX - 1; i++)
+					full[full_len++] = line->words[wc].text[i];
+				wc++;
+			}
+		}
+		full[full_len] = 0;
+		wcsncpy(line->full_text, full, META_MAX - 1);
+		line->word_count = wc;
+
+		if (wc > 0) g_lrc_line_count++;
+
+		/* Skip newline */
+		if (*p == '\n') p++;
+	}
+	g_lrc_loaded = g_lrc_line_count > 0;
+	g_lrc_cur_line = -1;
+	g_lrc_tex_valid = false;
+	g_lrc_tex_line = -1;
+}
+
+/* Find which line is active at given time */
+static int find_lrc_line(float t) {
+	int best = -1;
+	for (int i = 0; i < g_lrc_line_count; i++) {
+		if (g_lrc_lines[i].time <= t) best = i;
+		else break;
+	}
+	return best;
+}
+
+/* Create lyrics texture for a given line */
+static void create_lrc_texture(int line_idx) {
+	if (line_idx < 0 || line_idx >= g_lrc_line_count) return;
+	lrc_line_t *line = &g_lrc_lines[line_idx];
+	if (line->full_text[0] == 0) return;
+
+	HDC screen_dc = GetDC(NULL);
+	HDC mem_dc = CreateCompatibleDC(screen_dc);
+
+	HFONT font = make_font(44, FW_BOLD);
+	HFONT old_font = SelectObject(mem_dc, font);
+
+	/* Measure full text */
+	SIZE sz;
+	GetTextExtentPoint32W(mem_dc, line->full_text, (int)wcslen(line->full_text), &sz);
+
+	/* Measure each word to get pixel positions for highlighting */
+	int cursor_x = 0;
+	for (int w = 0; w < line->word_count; w++) {
+		SIZE wsz;
+		GetTextExtentPoint32W(mem_dc, line->words[w].text, (int)wcslen(line->words[w].text), &wsz);
+		line->words[w].pixel_x = cursor_x;
+		line->words[w].pixel_w = wsz.cx;
+		cursor_x += wsz.cx;
+		/* Add space width */
+		if (w < line->word_count - 1) {
+			SIZE spsz;
+			GetTextExtentPoint32W(mem_dc, L" ", 1, &spsz);
+			cursor_x += spsz.cx;
+		}
+	}
+
+	int margin = 30;
+	int tex_w = sz.cx + margin * 2 + 12;
+	int tex_h = sz.cy + 24 + 12; /* padding + glow */
+
+	int pot_w = 1; while (pot_w < tex_w) pot_w <<= 1;
+	int pot_h = 1; while (pot_h < tex_h) pot_h <<= 1;
+
+	BITMAPINFO bmi = { 0 };
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = pot_w;
+	bmi.bmiHeader.biHeight = pot_h;
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+	BYTE *pixels = NULL;
+	HBITMAP bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, (void**)&pixels, NULL, 0);
+	HBITMAP old_bmp = SelectObject(mem_dc, bmp);
+
+	memset(pixels, 0, pot_w * pot_h * 4);
+	SetBkMode(mem_dc, TRANSPARENT);
+
+	/* Draw subtle background */
+	int text_y = (pot_h - sz.cy) / 2;
+	for (int y = text_y - 8; y < text_y + sz.cy + 8 && y < pot_h; y++) {
+		if (y < 0) continue;
+		for (int x = 0; x < tex_w && x < pot_w; x++) {
+			BYTE *px = pixels + (y * pot_w + x) * 4;
+			/* Center-weighted gradient */
+			float fx = (float)x / (float)tex_w;
+			float a = 1.0f;
+			if (fx < 0.1f) a = fx / 0.1f;
+			else if (fx > 0.9f) a = (1.0f - fx) / 0.1f;
+			if (a < 0.0f) a = 0.0f;
+			px[0] = 0; px[1] = 0; px[2] = 0;
+			px[3] = (BYTE)(a * 140.0f);
+		}
+	}
+
+	/* Draw text with shadow — dimmed white (will be colored by highlight in shader) */
+	int text_x = margin;
+	/* Shadow */
+	SetTextColor(mem_dc, RGB(0, 0, 0));
+	for (int dx = -2; dx <= 2; dx++)
+		for (int dy = -2; dy <= 2; dy++)
+			if (dx || dy)
+				TextOutW(mem_dc, text_x + dx, text_y + dy, line->full_text, (int)wcslen(line->full_text));
+
+	/* Main text in dimmed color (unhighlighted state) */
+	SetTextColor(mem_dc, RGB(140, 140, 160));
+	TextOutW(mem_dc, text_x, text_y, line->full_text, (int)wcslen(line->full_text));
+
+	/* Fix alpha */
+	for (int y = 0; y < pot_h; y++) {
+		for (int x = 0; x < pot_w; x++) {
+			BYTE *px = pixels + (y * pot_w + x) * 4;
+			BYTE max_c = px[0]; if (px[1] > max_c) max_c = px[1]; if (px[2] > max_c) max_c = px[2];
+			if (max_c > px[3]) px[3] = max_c;
+		}
+	}
+
+	if (!g_lrc_texture) glGenTextures(1, &g_lrc_texture);
+	glBindTexture(GL_TEXTURE_2D, g_lrc_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pot_w, pot_h, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
+
+	g_lrc_tex_w = pot_w;
+	g_lrc_tex_h = pot_h;
+	g_lrc_tex_valid = true;
+	g_lrc_tex_line = line_idx;
+
+	SelectObject(mem_dc, old_bmp);
+	SelectObject(mem_dc, old_font);
+	DeleteObject(bmp);
+	DeleteObject(font);
+	DeleteDC(mem_dc);
+	ReleaseDC(NULL, screen_dc);
+}
+
+/* Render lyrics overlay with word-by-word highlighting */
+static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) {
+	if (!g_lrc_loaded || !g_lrc_tex_valid || !g_lrc_texture) return;
+	if (g_lrc_cur_line < 0 || g_lrc_cur_line >= g_lrc_line_count) return;
+
+	lrc_line_t *line = &g_lrc_lines[g_lrc_cur_line];
+
+	/* Calculate fade */
+	float alpha = 1.0f;
+	if (g_lrc_line_fade < LRC_FADE_DURATION) {
+		alpha = g_lrc_line_fade / LRC_FADE_DURATION;
+		alpha = alpha * alpha * (3.0f - 2.0f * alpha); /* smoothstep */
+	}
+
+	/* Position: bottom center */
+	float margin_y = 50.0f / (float)screen_h * 2.0f;
+	float quad_w = (float)g_lrc_tex_w / (float)screen_w * 2.0f;
+	float quad_h = (float)g_lrc_tex_h / (float)screen_h * 2.0f;
+	float x0 = -quad_w * 0.5f;  /* centered */
+	float x1 = quad_w * 0.5f;
+	float y0 = -1.0f + margin_y;
+	float y1 = y0 + quad_h;
+
+	/* First pass: draw the dimmed base text */
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glEnable(GL_TEXTURE_2D);
+	glBindTexture(GL_TEXTURE_2D, g_lrc_texture);
+
+	glColor4f(1.0f, 1.0f, 1.0f, alpha);
+	glBegin(GL_QUADS);
+		glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y0);
+		glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y0);
+		glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y1);
+	glEnd();
+
+	/* Second pass: draw bright highlight over sung words */
+	/* Calculate highlight region based on current word timing */
+	float margin_px = 30.0f;
+	float tex_content_w = (float)g_lrc_tex_w; /* texture width */
+	float highlight_end_px = margin_px; /* default: nothing highlighted */
+
+	for (int w = 0; w < line->word_count; w++) {
+		if (playback_time >= line->words[w].time) {
+			/* This word has started — highlight includes it */
+			float word_end = margin_px + (float)line->words[w].pixel_x + (float)line->words[w].pixel_w;
+			/* Smooth transition within the word */
+			float word_start_time = line->words[w].time;
+			float word_end_time = (w + 1 < line->word_count) ? line->words[w+1].time : word_start_time + 0.5f;
+			float word_progress = (playback_time - word_start_time) / (word_end_time - word_start_time);
+			if (word_progress > 1.0f) word_progress = 1.0f;
+			if (word_progress < 0.0f) word_progress = 0.0f;
+			/* Smooth the progress */
+			word_progress = word_progress * word_progress * (3.0f - 2.0f * word_progress);
+			highlight_end_px = margin_px + (float)line->words[w].pixel_x +
+				(float)line->words[w].pixel_w * word_progress;
+		}
+	}
+
+	/* Convert pixel highlight to texture coordinate */
+	float highlight_u = highlight_end_px / tex_content_w;
+	if (highlight_u > 1.0f) highlight_u = 1.0f;
+
+	if (highlight_u > 0.0f) {
+		/* Draw highlight quad — only the highlighted portion, with bright color + additive blend */
+		float hx1 = x0 + (x1 - x0) * highlight_u;
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE); /* additive for glow effect */
+		glColor4f(1.0f, 1.0f, 0.6f, alpha * 0.9f); /* warm bright yellow-white */
+		glBegin(GL_QUADS);
+			glTexCoord2f(0.0f, 1.0f);         glVertex2f(x0, y0);
+			glTexCoord2f(highlight_u, 1.0f);   glVertex2f(hx1, y0);
+			glTexCoord2f(highlight_u, 0.0f);   glVertex2f(hx1, y1);
+			glTexCoord2f(0.0f, 0.0f);          glVertex2f(x0, y1);
+		glEnd();
+	}
 
 	glDisable(GL_TEXTURE_2D);
 	glDisable(GL_BLEND);
@@ -5978,12 +6311,60 @@ static void* Thread(void* p_data) {
 			}
 		}
 
+		/* Render synced lyrics overlay if enabled and loaded */
+		{
+			bool show_lyrics = config_GetInt(p->p_obj, "auraviz-lyrics") != 0;
+
+			/* Check for new LRC data from Lua */
+			if (!g_lrc_loaded) {
+				char *lrc_data = config_GetPsz(p->p_obj, "auraviz-lyric-data");
+				if (lrc_data && lrc_data[0]) {
+					/* Simple change detection: check first 60 chars */
+					char sig[64]; strncpy(sig, lrc_data, 63); sig[63] = 0;
+					if (strcmp(sig, g_lrc_last_data) != 0) {
+						strncpy(g_lrc_last_data, sig, 63); g_lrc_last_data[63] = 0;
+						parse_lrc_data(lrc_data);
+					}
+				}
+				free(lrc_data);
+			}
+
+			if (show_lyrics && g_lrc_loaded) {
+				/* Get playback time from accumulated samples */
+				float playback_time = p->time_acc;
+
+				/* Find current line */
+				int new_line = find_lrc_line(playback_time);
+
+				if (new_line != g_lrc_cur_line) {
+					g_lrc_cur_line = new_line;
+					g_lrc_line_fade = 0.0f;
+					/* Need new texture for this line */
+					if (new_line >= 0 && new_line != g_lrc_tex_line) {
+						create_lrc_texture(new_line);
+					}
+				}
+				g_lrc_line_fade += dt;
+
+				if (g_lrc_cur_line >= 0 && g_lrc_tex_valid) {
+					gl_UseProgram(0);
+					glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+					glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+					render_lrc_overlay(cur_w, cur_h, playback_time);
+					glMatrixMode(GL_PROJECTION); glPopMatrix();
+					glMatrixMode(GL_MODELVIEW); glPopMatrix();
+				}
+			}
+		}
+
 		SwapBuffers(p->hdc); block_Release(p_block);
 	}
 	for (int i = 0; i < NUM_PRESETS; i++) if (p->programs[i]) gl_DeleteProgram(p->programs[i]);
 	if (p->blend_program) gl_DeleteProgram(p->blend_program);
 	if (p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
 	if (g_meta_texture) { glDeleteTextures(1, &g_meta_texture); g_meta_texture = 0; g_meta_tex_valid = false; }
+	if (g_lrc_texture) { glDeleteTextures(1, &g_lrc_texture); g_lrc_texture = 0; g_lrc_tex_valid = false; }
+	g_lrc_loaded = false; g_lrc_line_count = 0; g_lrc_cur_line = -1; g_lrc_last_data[0] = 0;
 	destroy_fbos(p);
 	g_last_preset = p->preset;
 	/* Save window position and size for restoration on next song */
