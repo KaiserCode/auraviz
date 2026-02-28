@@ -5184,6 +5184,7 @@ static volatile bool g_lock_position = false;
 static volatile int g_kb_preset_delta = 0;
 static HICON g_app_icon = NULL;
 static int g_persistent_x = CW_USEDEFAULT, g_persistent_y = CW_USEDEFAULT;
+static int g_saved_win_w = 0, g_saved_win_h = 0;  /* window frame size (including borders) */
 static bool g_has_saved_position = false;
 
 /* == Song Metadata Overlay == */
@@ -5194,8 +5195,8 @@ static wchar_t g_meta_title[META_MAX] = L"";
 static char g_meta_last_config[META_MAX * 3] = "";  /* track config changes */
 static volatile bool g_meta_new = false;
 static float g_meta_timer = 0.0f;
-#define META_SHOW_DURATION 7.0f
-#define META_FADE_START    5.0f
+#define META_SHOW_DURATION 10.0f
+#define META_FADE_START    7.0f
 #define META_SLIDE_DURATION 0.5f                     /* slide-in animation */
 static GLuint g_meta_texture = 0;
 static int g_meta_tex_w = 0, g_meta_tex_h = 0;
@@ -5350,12 +5351,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	case WM_SIZE: {
 		int w = LOWORD(lp), h = HIWORD(lp);
 		if (w > 0 && h > 0) { g_resize_w = w; g_resize_h = h; g_resized = true; }
+		/* Save full window frame rect for restore on song change */
+		if (!g_fullscreen && !g_fs_transition) {
+			RECT wr; if (GetWindowRect(hwnd, &wr)) {
+				g_persistent_x = wr.left; g_persistent_y = wr.top;
+				g_saved_win_w = wr.right - wr.left;
+				g_saved_win_h = wr.bottom - wr.top;
+				g_has_saved_position = true;
+			}
+		}
 		return 0;
 	}
 	case WM_MOVE: {
 		if (!g_fullscreen && !g_fs_transition) {
 			RECT wr; if (GetWindowRect(hwnd, &wr)) {
 				g_persistent_x = wr.left; g_persistent_y = wr.top;
+				g_saved_win_w = wr.right - wr.left;
+				g_saved_win_h = wr.bottom - wr.top;
 				g_has_saved_position = true;
 			}
 		}
@@ -5608,10 +5620,15 @@ static int init_gl_context(auraviz_thread_t * p) {
 		/* If window was in fullscreen, leave it alone � don't touch style or visibility.
 		   If windowed, just make sure it's visible without activating. */
 		if (!g_fullscreen) {
-			/* Restore saved position if we have one — prevents window drift on song change */
+			/* Restore saved position and size — prevents drift on song change */
 			if (g_has_saved_position) {
-				SetWindowPos(p->hwnd, NULL, g_persistent_x, g_persistent_y, 0, 0,
-					SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+				UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
+				if (g_saved_win_w > 0 && g_saved_win_h > 0)
+					SetWindowPos(p->hwnd, NULL, g_persistent_x, g_persistent_y,
+						g_saved_win_w, g_saved_win_h, flags);
+				else
+					SetWindowPos(p->hwnd, NULL, g_persistent_x, g_persistent_y,
+						0, 0, flags | SWP_NOSIZE);
 			}
 			if (!IsWindowVisible(p->hwnd)) ShowWindow(p->hwnd, SW_SHOWNA);
 		}
@@ -5634,11 +5651,17 @@ static int init_gl_context(auraviz_thread_t * p) {
 		RegisterClassExW(&wc); g_wndclass_registered = true;
 	}
 	DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-	RECT r = { 0, 0, p->i_width, p->i_height }; AdjustWindowRect(&r, style, FALSE);
 	int wx = g_has_saved_position ? g_persistent_x : CW_USEDEFAULT;
 	int wy = g_has_saved_position ? g_persistent_y : CW_USEDEFAULT;
+	int ww, wh;
+	if (g_has_saved_position && g_saved_win_w > 0 && g_saved_win_h > 0) {
+		ww = g_saved_win_w; wh = g_saved_win_h;
+	} else {
+		RECT r = { 0, 0, p->i_width, p->i_height }; AdjustWindowRect(&r, style, FALSE);
+		ww = r.right - r.left; wh = r.bottom - r.top;
+	}
 	p->hwnd = CreateWindowExW(g_ontop ? WS_EX_TOPMOST : 0, WNDCLASS_NAME, L"AuraViz", style,
-		wx, wy, r.right - r.left, r.bottom - r.top,
+		wx, wy, ww, wh,
 		NULL, NULL, GetModuleHandle(NULL), NULL);
 	if (!p->hwnd) return -1;
 	set_window_icon(p->hwnd);
@@ -5963,10 +5986,12 @@ static void* Thread(void* p_data) {
 	if (g_meta_texture) { glDeleteTextures(1, &g_meta_texture); g_meta_texture = 0; g_meta_tex_valid = false; }
 	destroy_fbos(p);
 	g_last_preset = p->preset;
-	/* Save window position for restoration on next song */
+	/* Save window position and size for restoration on next song */
 	if (p->hwnd && !g_fullscreen) {
 		RECT wr; if (GetWindowRect(p->hwnd, &wr)) {
 			g_persistent_x = wr.left; g_persistent_y = wr.top;
+			g_saved_win_w = wr.right - wr.left;
+			g_saved_win_h = wr.bottom - wr.top;
 			g_has_saved_position = true;
 		}
 	}
