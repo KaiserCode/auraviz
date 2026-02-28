@@ -5919,7 +5919,7 @@ static void* Thread(void* p_data) {
 				glClear(GL_COLOR_BUFFER_BIT);
 				SwapBuffers(p->hdc);
 				block_Release(p_block);
-				vlc_tick_sleep(VLC_TICK_FROM_MS(50));
+				Sleep(50);
 				continue;
 			}
 			if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS) {
