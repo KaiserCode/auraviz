@@ -5202,6 +5202,7 @@ static float g_meta_timer = 0.0f;
 #define META_SLIDE_DURATION 0.5f                     /* slide-in animation */
 static GLuint g_meta_texture = 0;
 static int g_meta_tex_w = 0, g_meta_tex_h = 0;
+static int g_meta_content_w = 0, g_meta_content_h = 0;
 static bool g_meta_tex_valid = false;
 
 /* == Lyrics Overlay (Enhanced LRC) == */
@@ -5231,6 +5232,7 @@ static int g_lrc_cur_line = -1;        /* current active line index */
 static float g_lrc_line_fade = 0.0f;   /* fade timer for line transitions */
 static GLuint g_lrc_texture = 0;
 static int g_lrc_tex_w = 0, g_lrc_tex_h = 0;
+static int g_lrc_content_w = 0, g_lrc_content_h = 0; /* actual text area size */
 static bool g_lrc_tex_valid = false;
 static int g_lrc_tex_line = -1;        /* which line the texture was built for */
 #define LRC_FADE_DURATION 0.3f
@@ -5515,11 +5517,11 @@ static void create_meta_texture(void) {
 	int pot_w = 1; while (pot_w < tex_w) pot_w <<= 1;
 	int pot_h = 1; while (pot_h < tex_h) pot_h <<= 1;
 
-	/* Create DIB */
+	/* Create DIB — standard bottom-up */
 	BITMAPINFO bmi = { 0 };
 	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 	bmi.bmiHeader.biWidth = pot_w;
-	bmi.bmiHeader.biHeight = pot_h; /* bottom-up */
+	bmi.bmiHeader.biHeight = pot_h;
 	bmi.bmiHeader.biPlanes = 1;
 	bmi.bmiHeader.biBitCount = 32;
 	bmi.bmiHeader.biCompression = BI_RGB;
@@ -5545,21 +5547,21 @@ static void create_meta_texture(void) {
 		}
 	}
 
-	/* Draw each line with glow — note: DIB is bottom-up, so flip Y */
+	/* Draw each line with glow — top-down DIB so y_artist is at top */
 	if (g_meta_artist[0]) {
 		SelectObject(mem_dc, font_artist);
 		draw_text_with_glow(mem_dc, g_meta_artist, margin_left,
-			pot_h - y_artist - sz_artist.cy, RGB(255, 255, 255));
+			y_artist, RGB(255, 255, 255));
 	}
 	if (g_meta_album[0]) {
 		SelectObject(mem_dc, font_album);
 		draw_text_with_glow(mem_dc, g_meta_album, margin_left,
-			pot_h - y_album - sz_album.cy, RGB(200, 200, 220));
+			y_album, RGB(200, 200, 220));
 	}
 	if (g_meta_title[0]) {
 		SelectObject(mem_dc, font_title);
 		draw_text_with_glow(mem_dc, g_meta_title, margin_left,
-			pot_h - y_title - sz_title.cy, RGB(180, 210, 255));
+			y_title, RGB(180, 210, 255));
 	}
 
 	/* Fix alpha: GDI draws into RGB but doesn't set alpha.
@@ -5570,6 +5572,20 @@ static void create_meta_texture(void) {
 			BYTE max_c = p[0]; if (p[1] > max_c) max_c = p[1]; if (p[2] > max_c) max_c = p[2];
 			if (max_c > p[3]) p[3] = max_c;
 		}
+	}
+
+	/* Flip rows vertically: DIB is bottom-up but GL expects top-down for correct display */
+	{
+		int row_bytes = pot_w * 4;
+		BYTE *temp_row = (BYTE*)malloc(row_bytes);
+		for (int y = 0; y < pot_h / 2; y++) {
+			BYTE *top = pixels + y * row_bytes;
+			BYTE *bot = pixels + (pot_h - 1 - y) * row_bytes;
+			memcpy(temp_row, top, row_bytes);
+			memcpy(top, bot, row_bytes);
+			memcpy(bot, temp_row, row_bytes);
+		}
+		free(temp_row);
 	}
 
 	/* Upload to GL */
@@ -5583,6 +5599,8 @@ static void create_meta_texture(void) {
 
 	g_meta_tex_w = pot_w;
 	g_meta_tex_h = pot_h;
+	g_meta_content_w = tex_w + 40; /* include gradient area */
+	g_meta_content_h = tex_h;
 	g_meta_tex_valid = true;
 
 	SelectObject(mem_dc, old_bmp);
@@ -5614,11 +5632,13 @@ static void render_meta_overlay(int screen_w, int screen_h) {
 		if (alpha < 0.0f) alpha = 0.0f;
 	}
 
-	/* Position: top-left with margin */
+	/* Position: top-left with margin — use content size for accurate sizing */
 	float margin_x = 30.0f / (float)screen_w * 2.0f;
 	float margin_y = 30.0f / (float)screen_h * 2.0f;
-	float quad_w = (float)g_meta_tex_w / (float)screen_w * 2.0f;
-	float quad_h = (float)g_meta_tex_h / (float)screen_h * 2.0f;
+	float u_max = (float)g_meta_content_w / (float)g_meta_tex_w;
+	float v_max = (float)g_meta_content_h / (float)g_meta_tex_h;
+	float quad_w = (float)g_meta_content_w / (float)screen_w * 2.0f;
+	float quad_h = (float)g_meta_content_h / (float)screen_h * 2.0f;
 	float x0 = -1.0f + margin_x + slide_x;
 	float y1 = 1.0f - margin_y;  /* top edge */
 	float x1 = x0 + quad_w;
@@ -5635,10 +5655,10 @@ static void render_meta_overlay(int screen_w, int screen_h) {
 
 	glColor4f(1.0f, 1.0f, 1.0f, alpha);
 	glBegin(GL_QUADS);
-		glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y0);
-		glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y0);
-		glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y1);
-		glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y1);
+		glTexCoord2f(0.0f, 0.0f);    glVertex2f(x0, y0);
+		glTexCoord2f(u_max, 0.0f);   glVertex2f(x1, y0);
+		glTexCoord2f(u_max, v_max);  glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, v_max);   glVertex2f(x0, y1);
 	glEnd();
 
 	glDisable(GL_TEXTURE_2D);
@@ -5843,6 +5863,20 @@ static void create_lrc_texture(int line_idx) {
 		}
 	}
 
+	/* Flip rows vertically for GL */
+	{
+		int row_bytes = pot_w * 4;
+		BYTE *temp_row = (BYTE*)malloc(row_bytes);
+		for (int y = 0; y < pot_h / 2; y++) {
+			BYTE *top = pixels + y * row_bytes;
+			BYTE *bot = pixels + (pot_h - 1 - y) * row_bytes;
+			memcpy(temp_row, top, row_bytes);
+			memcpy(top, bot, row_bytes);
+			memcpy(bot, temp_row, row_bytes);
+		}
+		free(temp_row);
+	}
+
 	if (!g_lrc_texture) glGenTextures(1, &g_lrc_texture);
 	glBindTexture(GL_TEXTURE_2D, g_lrc_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -5853,6 +5887,8 @@ static void create_lrc_texture(int line_idx) {
 
 	g_lrc_tex_w = pot_w;
 	g_lrc_tex_h = pot_h;
+	g_lrc_content_w = tex_w;
+	g_lrc_content_h = tex_h;
 	g_lrc_tex_valid = true;
 	g_lrc_tex_line = line_idx;
 
@@ -5878,10 +5914,12 @@ static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) 
 		alpha = alpha * alpha * (3.0f - 2.0f * alpha); /* smoothstep */
 	}
 
-	/* Position: bottom center */
+	/* Position: bottom center — use content size, not pot size */
 	float margin_y = 50.0f / (float)screen_h * 2.0f;
-	float quad_w = (float)g_lrc_tex_w / (float)screen_w * 2.0f;
-	float quad_h = (float)g_lrc_tex_h / (float)screen_h * 2.0f;
+	float u_max = (float)g_lrc_content_w / (float)g_lrc_tex_w; /* portion of texture used */
+	float v_max = (float)g_lrc_content_h / (float)g_lrc_tex_h;
+	float quad_w = (float)g_lrc_content_w / (float)screen_w * 2.0f;
+	float quad_h = (float)g_lrc_content_h / (float)screen_h * 2.0f;
 	float x0 = -quad_w * 0.5f;  /* centered */
 	float x1 = quad_w * 0.5f;
 	float y0 = -1.0f + margin_y;
@@ -5895,16 +5933,15 @@ static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) 
 
 	glColor4f(1.0f, 1.0f, 1.0f, alpha);
 	glBegin(GL_QUADS);
-		glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y0);
-		glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y0);
-		glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y1);
-		glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y1);
+		glTexCoord2f(0.0f, 0.0f);    glVertex2f(x0, y0);
+		glTexCoord2f(u_max, 0.0f);   glVertex2f(x1, y0);
+		glTexCoord2f(u_max, v_max);  glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, v_max);   glVertex2f(x0, y1);
 	glEnd();
 
 	/* Second pass: draw bright highlight over sung words */
 	/* Calculate highlight region based on current word timing */
 	float margin_px = 30.0f;
-	float tex_content_w = (float)g_lrc_tex_w; /* texture width */
 	float highlight_end_px = margin_px; /* default: nothing highlighted */
 
 	for (int w = 0; w < line->word_count; w++) {
@@ -5925,19 +5962,19 @@ static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) 
 	}
 
 	/* Convert pixel highlight to texture coordinate */
-	float highlight_u = highlight_end_px / tex_content_w;
-	if (highlight_u > 1.0f) highlight_u = 1.0f;
+	float highlight_u = highlight_end_px / (float)g_lrc_content_w * u_max;
+	if (highlight_u > u_max) highlight_u = u_max;
 
 	if (highlight_u > 0.0f) {
 		/* Draw highlight quad — only the highlighted portion, with bright color + additive blend */
-		float hx1 = x0 + (x1 - x0) * highlight_u;
+		float hx1 = x0 + (x1 - x0) * (highlight_u / u_max);
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE); /* additive for glow effect */
 		glColor4f(1.0f, 1.0f, 0.6f, alpha * 0.9f); /* warm bright yellow-white */
 		glBegin(GL_QUADS);
-			glTexCoord2f(0.0f, 1.0f);         glVertex2f(x0, y0);
-			glTexCoord2f(highlight_u, 1.0f);   glVertex2f(hx1, y0);
-			glTexCoord2f(highlight_u, 0.0f);   glVertex2f(hx1, y1);
-			glTexCoord2f(0.0f, 0.0f);          glVertex2f(x0, y1);
+			glTexCoord2f(0.0f, 0.0f);         glVertex2f(x0, y0);
+			glTexCoord2f(highlight_u, 0.0f);   glVertex2f(hx1, y0);
+			glTexCoord2f(highlight_u, v_max);  glVertex2f(hx1, y1);
+			glTexCoord2f(0.0f, v_max);         glVertex2f(x0, y1);
 		glEnd();
 	}
 
