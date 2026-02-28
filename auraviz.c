@@ -5502,12 +5502,12 @@ static void create_meta_texture(void) {
 	if (sz_title.cx > max_w) max_w = sz_title.cx;
 
 	int total_h = margin_top;
-	int y_artist = total_h;
-	if (g_meta_artist[0]) total_h += sz_artist.cy + line_gap;
+	int y_title = total_h;
+	if (g_meta_title[0]) total_h += sz_title.cy + line_gap;
 	int y_album = total_h;
 	if (g_meta_album[0]) total_h += sz_album.cy + line_gap;
-	int y_title = total_h;
-	if (g_meta_title[0]) total_h += sz_title.cy;
+	int y_artist = total_h;
+	if (g_meta_artist[0]) total_h += sz_artist.cy;
 	total_h += margin_top; /* bottom padding */
 
 	int tex_w = margin_left + max_w + margin_left + 12; /* extra for glow */
@@ -5547,7 +5547,7 @@ static void create_meta_texture(void) {
 		}
 	}
 
-	/* Draw each line with glow — top-down DIB so y_artist is at top */
+	/* Draw each line with glow */
 	if (g_meta_artist[0]) {
 		SelectObject(mem_dc, font_artist);
 		draw_text_with_glow(mem_dc, g_meta_artist, margin_left,
@@ -5572,20 +5572,6 @@ static void create_meta_texture(void) {
 			BYTE max_c = p[0]; if (p[1] > max_c) max_c = p[1]; if (p[2] > max_c) max_c = p[2];
 			if (max_c > p[3]) p[3] = max_c;
 		}
-	}
-
-	/* Flip rows vertically: DIB is bottom-up but GL expects top-down for correct display */
-	{
-		int row_bytes = pot_w * 4;
-		BYTE *temp_row = (BYTE*)malloc(row_bytes);
-		for (int y = 0; y < pot_h / 2; y++) {
-			BYTE *top = pixels + y * row_bytes;
-			BYTE *bot = pixels + (pot_h - 1 - y) * row_bytes;
-			memcpy(temp_row, top, row_bytes);
-			memcpy(top, bot, row_bytes);
-			memcpy(bot, temp_row, row_bytes);
-		}
-		free(temp_row);
 	}
 
 	/* Upload to GL */
@@ -5655,10 +5641,10 @@ static void render_meta_overlay(int screen_w, int screen_h) {
 
 	glColor4f(1.0f, 1.0f, 1.0f, alpha);
 	glBegin(GL_QUADS);
-		glTexCoord2f(0.0f, 0.0f);    glVertex2f(x0, y0);
-		glTexCoord2f(u_max, 0.0f);   glVertex2f(x1, y0);
-		glTexCoord2f(u_max, v_max);  glVertex2f(x1, y1);
-		glTexCoord2f(0.0f, v_max);   glVertex2f(x0, y1);
+		glTexCoord2f(0.0f, v_max);   glVertex2f(x0, y0);
+		glTexCoord2f(u_max, v_max);  glVertex2f(x1, y0);
+		glTexCoord2f(u_max, 0.0f);   glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, 0.0f);    glVertex2f(x0, y1);
 	glEnd();
 
 	glDisable(GL_TEXTURE_2D);
@@ -5863,20 +5849,6 @@ static void create_lrc_texture(int line_idx) {
 		}
 	}
 
-	/* Flip rows vertically for GL */
-	{
-		int row_bytes = pot_w * 4;
-		BYTE *temp_row = (BYTE*)malloc(row_bytes);
-		for (int y = 0; y < pot_h / 2; y++) {
-			BYTE *top = pixels + y * row_bytes;
-			BYTE *bot = pixels + (pot_h - 1 - y) * row_bytes;
-			memcpy(temp_row, top, row_bytes);
-			memcpy(top, bot, row_bytes);
-			memcpy(bot, temp_row, row_bytes);
-		}
-		free(temp_row);
-	}
-
 	if (!g_lrc_texture) glGenTextures(1, &g_lrc_texture);
 	glBindTexture(GL_TEXTURE_2D, g_lrc_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -5933,10 +5905,10 @@ static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) 
 
 	glColor4f(1.0f, 1.0f, 1.0f, alpha);
 	glBegin(GL_QUADS);
-		glTexCoord2f(0.0f, 0.0f);    glVertex2f(x0, y0);
-		glTexCoord2f(u_max, 0.0f);   glVertex2f(x1, y0);
-		glTexCoord2f(u_max, v_max);  glVertex2f(x1, y1);
-		glTexCoord2f(0.0f, v_max);   glVertex2f(x0, y1);
+		glTexCoord2f(0.0f, v_max);   glVertex2f(x0, y0);
+		glTexCoord2f(u_max, v_max);  glVertex2f(x1, y0);
+		glTexCoord2f(u_max, 0.0f);   glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, 0.0f);    glVertex2f(x0, y1);
 	glEnd();
 
 	/* Second pass: draw bright highlight over sung words */
@@ -5971,10 +5943,10 @@ static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) 
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE); /* additive for glow effect */
 		glColor4f(1.0f, 1.0f, 0.6f, alpha * 0.9f); /* warm bright yellow-white */
 		glBegin(GL_QUADS);
-			glTexCoord2f(0.0f, 0.0f);         glVertex2f(x0, y0);
-			glTexCoord2f(highlight_u, 0.0f);   glVertex2f(hx1, y0);
-			glTexCoord2f(highlight_u, v_max);  glVertex2f(hx1, y1);
-			glTexCoord2f(0.0f, v_max);         glVertex2f(x0, y1);
+			glTexCoord2f(0.0f, v_max);         glVertex2f(x0, y0);
+			glTexCoord2f(highlight_u, v_max);   glVertex2f(hx1, y0);
+			glTexCoord2f(highlight_u, 0.0f);   glVertex2f(hx1, y1);
+			glTexCoord2f(0.0f, 0.0f);          glVertex2f(x0, y1);
 		glEnd();
 	}
 
