@@ -28,8 +28,6 @@
 #include <vlc_aout.h>
 #include <vlc_block.h>
 #include <vlc_configuration.h>
-#include <vlc_input.h>
-#include <vlc_playlist.h>
 
 #include <GL/gl.h>
 #include <GL/glext.h>
@@ -76,6 +74,7 @@ add_integer("auraviz-smooth", 50, "Smoothing", "0-100", false)
 change_integer_range(0, 100)
 add_bool("auraviz-ontop", true, "Always on top", "Keep visualization window above other windows", false)
 add_bool("auraviz-meta", true, "Show song info", "Display artist and title overlay on song change", false)
+add_string("auraviz-meta-text", "", "Metadata text", "Song info text set by Lua extension", false)
 set_callbacks(Open, Close)
 add_shortcut("auraviz")
 vlc_module_end()
@@ -5372,92 +5371,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 /* == Metadata Fetching == */
 static void fetch_metadata(vlc_object_t *p_obj) {
-	wchar_t result[META_MAX] = L"";
-	char *artist = NULL, *title = NULL, *uri = NULL;
-	bool got_meta = false;
-
-	/* Try to get metadata from the current playlist input */
-	playlist_t *pl = pl_Get(p_obj);
-	if (pl) {
-		input_thread_t *input = playlist_CurrentInput(pl);
-		if (input) {
-			input_item_t *item = input_GetItem(input);
-			if (item) {
-				vlc_mutex_lock(&item->lock);
-				if (item->p_meta) {
-					const char *m;
-					m = vlc_meta_Get(item->p_meta, vlc_meta_Artist);
-					if (m && m[0]) artist = strdup(m);
-					m = vlc_meta_Get(item->p_meta, vlc_meta_Title);
-					if (m && m[0]) title = strdup(m);
-				}
-				vlc_mutex_unlock(&item->lock);
-				uri = input_item_GetURI(item);
-			}
-			vlc_object_release(input);
-		}
+	/* Metadata is passed from Lua via auraviz-meta-text config string */
+	char *meta_str = var_InheritString(p_obj, "auraviz-meta-text");
+	if (!meta_str || !meta_str[0]) {
+		free(meta_str);
+		/* Reset window title to default */
+		if (g_persistent_hwnd) SetWindowTextW(g_persistent_hwnd, L"AuraViz");
+		return;
 	}
 
-	/* Build display string with fallback chain */
-	if (artist && title) {
-		/* "Artist — Title" */
-		wchar_t w_artist[META_MAX/3], w_title[META_MAX/3];
-		MultiByteToWideChar(CP_UTF8, 0, artist, -1, w_artist, META_MAX/3);
-		MultiByteToWideChar(CP_UTF8, 0, title, -1, w_title, META_MAX/3);
-		_snwprintf(result, META_MAX-1, L"%s  \x2014  %s", w_artist, w_title);
-		got_meta = true;
-	} else if (title) {
-		MultiByteToWideChar(CP_UTF8, 0, title, -1, result, META_MAX);
-		got_meta = true;
-	} else if (artist) {
-		MultiByteToWideChar(CP_UTF8, 0, artist, -1, result, META_MAX);
-		got_meta = true;
-	}
+	/* Convert UTF-8 string from Lua to wide string */
+	MultiByteToWideChar(CP_UTF8, 0, meta_str, -1, g_meta_text, META_MAX);
+	g_meta_text[META_MAX-1] = 0;
+	g_meta_new = true;
+	g_meta_timer = 0.0f;
+	g_meta_tex_valid = false;
 
-	/* Fallback: parse filename from URI */
-	if (!got_meta && uri) {
-		/* URI is like "file:///C:/Music/artist%20-%20song.mp3" */
-		const char *slash = strrchr(uri, '/');
-		const char *fname = slash ? slash + 1 : uri;
-		/* Decode %20 etc and strip extension */
-		char decoded[META_MAX];
-		int di = 0;
-		for (int i = 0; fname[i] && di < META_MAX-1; i++) {
-			if (fname[i] == '%' && fname[i+1] && fname[i+2]) {
-				char hex[3] = { fname[i+1], fname[i+2], 0 };
-				decoded[di++] = (char)strtol(hex, NULL, 16);
-				i += 2;
-			} else {
-				decoded[di++] = fname[i];
-			}
-		}
-		decoded[di] = 0;
-		/* Strip extension */
-		char *dot = strrchr(decoded, '.');
-		if (dot) *dot = 0;
-		/* Replace underscores with spaces */
-		for (int i = 0; decoded[i]; i++)
-			if (decoded[i] == '_') decoded[i] = ' ';
-		if (decoded[0]) {
-			MultiByteToWideChar(CP_UTF8, 0, decoded, -1, result, META_MAX);
-			got_meta = true;
-		}
-	}
+	/* Set window title */
+	wchar_t wtitle[META_MAX + 16];
+	_snwprintf(wtitle, META_MAX+15, L"AuraViz - %s", g_meta_text);
+	if (g_persistent_hwnd) SetWindowTextW(g_persistent_hwnd, wtitle);
 
-	free(artist); free(title); free(uri);
-
-	if (got_meta) {
-		wcsncpy(g_meta_text, result, META_MAX-1);
-		g_meta_text[META_MAX-1] = 0;
-		g_meta_new = true;
-		g_meta_timer = 0.0f;
-		g_meta_tex_valid = false;
-
-		/* Also set window title */
-		wchar_t wtitle[META_MAX + 16];
-		_snwprintf(wtitle, META_MAX+15, L"AuraViz - %s", result);
-		if (g_persistent_hwnd) SetWindowTextW(g_persistent_hwnd, wtitle);
-	}
+	free(meta_str);
 }
 
 /* == Text-to-Texture Rendering (GDI) == */
@@ -5824,6 +5759,22 @@ static void* Thread(void* p_data) {
 		p->gain = config_GetInt(p->p_obj, "auraviz-gain");
 		p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
 		bool show_meta = config_GetInt(p->p_obj, "auraviz-meta") != 0;
+
+		/* Check for new metadata from Lua (may arrive after Open) */
+		if (show_meta && !g_meta_tex_valid && g_meta_timer < 1.0f) {
+			char *meta_check = config_GetPsz(p->p_obj, "auraviz-meta-text");
+			if (meta_check && meta_check[0] && g_meta_text[0] == 0) {
+				MultiByteToWideChar(CP_UTF8, 0, meta_check, -1, g_meta_text, META_MAX);
+				g_meta_text[META_MAX-1] = 0;
+				g_meta_new = true;
+				g_meta_timer = 0.0f;
+				/* Set window title */
+				wchar_t wtitle[META_MAX + 16];
+				_snwprintf(wtitle, META_MAX+15, L"AuraViz - %s", g_meta_text);
+				if (p->hwnd) SetWindowTextW(p->hwnd, wtitle);
+			}
+			free(meta_check);
+		}
 
 		int active;
 		/* Handle keyboard preset navigation */
