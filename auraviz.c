@@ -5187,12 +5187,16 @@ static int g_persistent_x = CW_USEDEFAULT, g_persistent_y = CW_USEDEFAULT;
 static bool g_has_saved_position = false;
 
 /* == Song Metadata Overlay == */
-#define META_MAX 512
-static wchar_t g_meta_text[META_MAX] = L"";    /* "Artist \x2014 Title" or fallback */
-static volatile bool g_meta_new = false;         /* flag: new metadata ready */
-static float g_meta_timer = 0.0f;                /* seconds since song change */
-#define META_SHOW_DURATION 5.0f                  /* total display time */
-#define META_FADE_START    3.5f                  /* start fading at this time */
+#define META_MAX 256
+static wchar_t g_meta_artist[META_MAX] = L"";
+static wchar_t g_meta_album[META_MAX] = L"";
+static wchar_t g_meta_title[META_MAX] = L"";
+static char g_meta_last_config[META_MAX * 3] = "";  /* track config changes */
+static volatile bool g_meta_new = false;
+static float g_meta_timer = 0.0f;
+#define META_SHOW_DURATION 7.0f
+#define META_FADE_START    5.0f
+#define META_SLIDE_DURATION 0.5f                     /* slide-in animation */
 static GLuint g_meta_texture = 0;
 static int g_meta_tex_w = 0, g_meta_tex_h = 0;
 static bool g_meta_tex_valid = false;
@@ -5371,60 +5375,102 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 /* == Metadata Fetching == */
 static void fetch_metadata(vlc_object_t *p_obj) {
-	/* Metadata is passed from Lua via auraviz-meta-text config string */
-	char *meta_str = var_InheritString(p_obj, "auraviz-meta-text");
-	if (!meta_str || !meta_str[0]) {
-		free(meta_str);
-		/* Reset window title to default */
-		if (g_persistent_hwnd) SetWindowTextW(g_persistent_hwnd, L"AuraViz");
-		return;
-	}
-
-	/* Convert UTF-8 string from Lua to wide string */
-	MultiByteToWideChar(CP_UTF8, 0, meta_str, -1, g_meta_text, META_MAX);
-	g_meta_text[META_MAX-1] = 0;
-	g_meta_new = true;
+	/* Reset metadata state — render loop will poll config for new text */
+	g_meta_artist[0] = 0;
+	g_meta_album[0] = 0;
+	g_meta_title[0] = 0;
+	g_meta_last_config[0] = 0;
+	g_meta_new = false;
 	g_meta_timer = 0.0f;
 	g_meta_tex_valid = false;
-
-	/* Set window title */
-	wchar_t wtitle[META_MAX + 16];
-	_snwprintf(wtitle, META_MAX+15, L"AuraViz - %s", g_meta_text);
-	if (g_persistent_hwnd) SetWindowTextW(g_persistent_hwnd, wtitle);
-
-	free(meta_str);
+	(void)p_obj;
 }
 
 /* == Text-to-Texture Rendering (GDI) == */
-static void create_meta_texture(void) {
-	if (g_meta_text[0] == 0) return;
+/* Helper: create a GDI font */
+static HFONT make_font(int height, int weight) {
+	HFONT f = CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+		CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+	if (!f) f = CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+		DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Arial");
+	return f;
+}
 
-	/* Create a memory DC and bitmap for text rendering */
+/* Helper: draw text with shadow/glow for cinematic look */
+static void draw_text_with_glow(HDC dc, const wchar_t *text, int x, int y, COLORREF color) {
+	int len = (int)wcslen(text);
+	/* Shadow passes — dark outline for depth */
+	SetTextColor(dc, RGB(0, 0, 0));
+	for (int dx = -2; dx <= 2; dx++) {
+		for (int dy = -2; dy <= 2; dy++) {
+			if (dx == 0 && dy == 0) continue;
+			TextOutW(dc, x + dx, y + dy, text, len);
+		}
+	}
+	/* Soft glow pass */
+	BYTE r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
+	SetTextColor(dc, RGB(r/3, g/3, b/3));
+	TextOutW(dc, x - 3, y, text, len);
+	TextOutW(dc, x + 3, y, text, len);
+	TextOutW(dc, x, y - 3, text, len);
+	TextOutW(dc, x, y + 3, text, len);
+	/* Main text */
+	SetTextColor(dc, color);
+	TextOutW(dc, x, y, text, len);
+}
+
+static void create_meta_texture(void) {
+	if (g_meta_artist[0] == 0 && g_meta_album[0] == 0 && g_meta_title[0] == 0) return;
+
 	HDC screen_dc = GetDC(NULL);
 	HDC mem_dc = CreateCompatibleDC(screen_dc);
 
-	/* Create font - use a nice size, semibold */
-	HFONT font = CreateFontW(
-		28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-		DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-		CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-	if (!font) font = CreateFontW(
-		28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-		DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Arial");
-	HFONT old_font = SelectObject(mem_dc, font);
+	/* Three font sizes: artist biggest, album medium, title slightly smaller */
+	HFONT font_artist = make_font(52, FW_BOLD);
+	HFONT font_album  = make_font(38, FW_NORMAL);
+	HFONT font_title  = make_font(32, FW_NORMAL);
 
-	/* Measure text size */
-	SIZE sz;
-	GetTextExtentPoint32W(mem_dc, g_meta_text, (int)wcslen(g_meta_text), &sz);
-	int tex_w = sz.cx + 24;  /* padding */
-	int tex_h = sz.cy + 12;
+	/* Measure each line */
+	SIZE sz_artist = {0}, sz_album = {0}, sz_title = {0};
+	int margin_left = 30, margin_top = 20, line_gap = 8;
 
-	/* Round up to power of 2 for better GL compat */
+	if (g_meta_artist[0]) {
+		SelectObject(mem_dc, font_artist);
+		GetTextExtentPoint32W(mem_dc, g_meta_artist, (int)wcslen(g_meta_artist), &sz_artist);
+	}
+	if (g_meta_album[0]) {
+		SelectObject(mem_dc, font_album);
+		GetTextExtentPoint32W(mem_dc, g_meta_album, (int)wcslen(g_meta_album), &sz_album);
+	}
+	if (g_meta_title[0]) {
+		SelectObject(mem_dc, font_title);
+		GetTextExtentPoint32W(mem_dc, g_meta_title, (int)wcslen(g_meta_title), &sz_title);
+	}
+
+	/* Calculate total texture size */
+	int max_w = sz_artist.cx;
+	if (sz_album.cx > max_w) max_w = sz_album.cx;
+	if (sz_title.cx > max_w) max_w = sz_title.cx;
+
+	int total_h = margin_top;
+	int y_artist = total_h;
+	if (g_meta_artist[0]) total_h += sz_artist.cy + line_gap;
+	int y_album = total_h;
+	if (g_meta_album[0]) total_h += sz_album.cy + line_gap;
+	int y_title = total_h;
+	if (g_meta_title[0]) total_h += sz_title.cy;
+	total_h += margin_top; /* bottom padding */
+
+	int tex_w = margin_left + max_w + margin_left + 12; /* extra for glow */
+	int tex_h = total_h + 8; /* extra for glow */
+
+	/* Round up to power of 2 */
 	int pot_w = 1; while (pot_w < tex_w) pot_w <<= 1;
 	int pot_h = 1; while (pot_h < tex_h) pot_h <<= 1;
 
-	/* Create DIB section (32-bit BGRA) */
+	/* Create DIB */
 	BITMAPINFO bmi = { 0 };
 	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 	bmi.bmiHeader.biWidth = pot_w;
@@ -5436,41 +5482,52 @@ static void create_meta_texture(void) {
 	HBITMAP bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, (void**)&pixels, NULL, 0);
 	HBITMAP old_bmp = SelectObject(mem_dc, bmp);
 
-	/* Clear to transparent black */
 	memset(pixels, 0, pot_w * pot_h * 4);
-
-	/* Draw dark semi-transparent background bar */
 	SetBkMode(mem_dc, TRANSPARENT);
-	int text_y = (pot_h - sz.cy) / 2;
-	int text_x = 12;
 
-	/* Draw background rectangle */
-	for (int y = text_y - 4; y < text_y + sz.cy + 4 && y < pot_h; y++) {
-		if (y < 0) continue;
-		for (int x = 0; x < tex_w && x < pot_w; x++) {
+	/* Draw subtle gradient background behind text area */
+	for (int y = 0; y < tex_h && y < pot_h; y++) {
+		/* Horizontal gradient: opaque on left, fading to transparent on right */
+		for (int x = 0; x < tex_w + 40 && x < pot_w; x++) {
 			BYTE *p = pixels + (y * pot_w + x) * 4;
-			p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 160; /* BGRA: black, ~63% opacity */
+			float fx = (float)x / (float)(tex_w + 40);
+			/* Smooth fade: full opacity on left 60%, then fade out */
+			float a = 1.0f;
+			if (fx > 0.6f) a = 1.0f - (fx - 0.6f) / 0.4f;
+			if (a < 0.0f) a = 0.0f;
+			p[0] = 0; p[1] = 0; p[2] = 0;
+			p[3] = (BYTE)(a * 160.0f); /* ~63% max opacity */
 		}
 	}
 
-	/* Draw text in white */
-	SetTextColor(mem_dc, RGB(255, 255, 255));
-	TextOutW(mem_dc, text_x, text_y, g_meta_text, (int)wcslen(g_meta_text));
+	/* Draw each line with glow — note: DIB is bottom-up, so flip Y */
+	if (g_meta_artist[0]) {
+		SelectObject(mem_dc, font_artist);
+		draw_text_with_glow(mem_dc, g_meta_artist, margin_left,
+			pot_h - y_artist - sz_artist.cy, RGB(255, 255, 255));
+	}
+	if (g_meta_album[0]) {
+		SelectObject(mem_dc, font_album);
+		draw_text_with_glow(mem_dc, g_meta_album, margin_left,
+			pot_h - y_album - sz_album.cy, RGB(200, 200, 220));
+	}
+	if (g_meta_title[0]) {
+		SelectObject(mem_dc, font_title);
+		draw_text_with_glow(mem_dc, g_meta_title, margin_left,
+			pot_h - y_title - sz_title.cy, RGB(180, 210, 255));
+	}
 
-	/* Now fix alpha channel - GDI doesn't set alpha, we need to fix pixels where text was drawn */
-	/* Strategy: text pixels will have non-zero R/G/B on black bg */
+	/* Fix alpha: GDI draws into RGB but doesn't set alpha.
+	   Where RGB > 0, we need to bump alpha above the background. */
 	for (int y = 0; y < pot_h; y++) {
 		for (int x = 0; x < pot_w; x++) {
 			BYTE *p = pixels + (y * pot_w + x) * 4;
 			BYTE max_c = p[0]; if (p[1] > max_c) max_c = p[1]; if (p[2] > max_c) max_c = p[2];
-			if (max_c > 0) {
-				/* Text pixel: use the max channel as alpha, set color to white */
-				p[3] = max_c > p[3] ? max_c : p[3];
-			}
+			if (max_c > p[3]) p[3] = max_c;
 		}
 	}
 
-	/* Upload to OpenGL texture */
+	/* Upload to GL */
 	if (!g_meta_texture) glGenTextures(1, &g_meta_texture);
 	glBindTexture(GL_TEXTURE_2D, g_meta_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -5483,11 +5540,11 @@ static void create_meta_texture(void) {
 	g_meta_tex_h = pot_h;
 	g_meta_tex_valid = true;
 
-	/* Cleanup GDI */
 	SelectObject(mem_dc, old_bmp);
-	SelectObject(mem_dc, old_font);
 	DeleteObject(bmp);
-	DeleteObject(font);
+	DeleteObject(font_artist);
+	DeleteObject(font_album);
+	DeleteObject(font_title);
 	DeleteDC(mem_dc);
 	ReleaseDC(NULL, screen_dc);
 }
@@ -5497,27 +5554,35 @@ static void render_meta_overlay(int screen_w, int screen_h) {
 	if (!g_meta_tex_valid || !g_meta_texture) return;
 	if (g_meta_timer > META_SHOW_DURATION) return;
 
-	/* Calculate alpha with fade */
+	/* Fade-in (slide from left) + fade-out */
 	float alpha = 1.0f;
+	float slide_x = 0.0f;
+	if (g_meta_timer < META_SLIDE_DURATION) {
+		float t = g_meta_timer / META_SLIDE_DURATION;
+		t = t * t * (3.0f - 2.0f * t); /* smoothstep */
+		alpha = t;
+		slide_x = (1.0f - t) * -0.15f; /* slide in from left */
+	}
 	if (g_meta_timer > META_FADE_START) {
-		alpha = 1.0f - (g_meta_timer - META_FADE_START) / (META_SHOW_DURATION - META_FADE_START);
+		float t = (g_meta_timer - META_FADE_START) / (META_SHOW_DURATION - META_FADE_START);
+		alpha *= (1.0f - t);
 		if (alpha < 0.0f) alpha = 0.0f;
 	}
 
-	/* Position: bottom-left with some margin */
-	float margin_x = 16.0f / (float)screen_w;
-	float margin_y = 24.0f / (float)screen_h;
+	/* Position: top-left with margin */
+	float margin_x = 30.0f / (float)screen_w * 2.0f;
+	float margin_y = 30.0f / (float)screen_h * 2.0f;
 	float quad_w = (float)g_meta_tex_w / (float)screen_w * 2.0f;
 	float quad_h = (float)g_meta_tex_h / (float)screen_h * 2.0f;
-	float x0 = -1.0f + margin_x;
-	float y0 = -1.0f + margin_y;
+	float x0 = -1.0f + margin_x + slide_x;
+	float y1 = 1.0f - margin_y;  /* top edge */
 	float x1 = x0 + quad_w;
-	float y1 = y0 + quad_h;
+	float y0 = y1 - quad_h;
 
-	/* Clamp to screen */
-	if (x1 > 0.95f) { x1 = 0.95f; x0 = x1 - quad_w; }
+	/* Clamp */
+	if (x1 > 0.98f) { float excess = x1 - 0.98f; x0 -= excess; x1 -= excess; }
 
-	/* Draw textured quad with alpha blending */
+	/* Draw textured quad */
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	glEnable(GL_TEXTURE_2D);
@@ -5760,17 +5825,45 @@ static void* Thread(void* p_data) {
 		p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
 		bool show_meta = config_GetInt(p->p_obj, "auraviz-meta") != 0;
 
-		/* Check for new metadata from Lua (may arrive after Open) */
-		if (show_meta && !g_meta_tex_valid && g_meta_timer < 1.0f) {
+		/* Check for new metadata from Lua every frame until text arrives or timeout */
+		if (show_meta && g_meta_timer < 5.0f) {
 			char *meta_check = config_GetPsz(p->p_obj, "auraviz-meta-text");
-			if (meta_check && meta_check[0] && g_meta_text[0] == 0) {
-				MultiByteToWideChar(CP_UTF8, 0, meta_check, -1, g_meta_text, META_MAX);
-				g_meta_text[META_MAX-1] = 0;
+			if (meta_check && meta_check[0] && strcmp(meta_check, g_meta_last_config) != 0) {
+				/* Parse "artist|album|title" */
+				strncpy(g_meta_last_config, meta_check, META_MAX*3-1);
+				g_meta_last_config[META_MAX*3-1] = 0;
+				char artist[META_MAX] = "", album[META_MAX] = "", title[META_MAX] = "";
+				char *p1 = strchr(meta_check, '|');
+				if (p1) {
+					*p1 = 0;
+					strncpy(artist, meta_check, META_MAX-1);
+					char *p2 = strchr(p1+1, '|');
+					if (p2) {
+						*p2 = 0;
+						strncpy(album, p1+1, META_MAX-1);
+						strncpy(title, p2+1, META_MAX-1);
+					} else {
+						strncpy(album, p1+1, META_MAX-1);
+					}
+				} else {
+					strncpy(title, meta_check, META_MAX-1);
+				}
+				MultiByteToWideChar(CP_UTF8, 0, artist, -1, g_meta_artist, META_MAX);
+				MultiByteToWideChar(CP_UTF8, 0, album, -1, g_meta_album, META_MAX);
+				MultiByteToWideChar(CP_UTF8, 0, title, -1, g_meta_title, META_MAX);
 				g_meta_new = true;
 				g_meta_timer = 0.0f;
+				g_meta_tex_valid = false;
 				/* Set window title */
-				wchar_t wtitle[META_MAX + 16];
-				_snwprintf(wtitle, META_MAX+15, L"AuraViz - %s", g_meta_text);
+				wchar_t wtitle[META_MAX * 2];
+				if (artist[0] && title[0])
+					_snwprintf(wtitle, META_MAX*2-1, L"AuraViz - %s - %s", g_meta_artist, g_meta_title);
+				else if (title[0])
+					_snwprintf(wtitle, META_MAX*2-1, L"AuraViz - %s", g_meta_title);
+				else if (artist[0])
+					_snwprintf(wtitle, META_MAX*2-1, L"AuraViz - %s", g_meta_artist);
+				else
+					_snwprintf(wtitle, META_MAX*2-1, L"AuraViz");
 				if (p->hwnd) SetWindowTextW(p->hwnd, wtitle);
 			}
 			free(meta_check);
@@ -5845,15 +5938,15 @@ static void* Thread(void* p_data) {
 			gl_UseProgram(0);
 		}
 
-		/* Render metadata overlay (artist/title) if enabled */
+		/* Render metadata overlay (artist/title/album) if enabled */
+		g_meta_timer += dt;
 		if (show_meta && (g_meta_new || g_meta_tex_valid)) {
 			gl_UseProgram(0); /* disable shader for fixed-function overlay */
 			if (g_meta_new) {
 				create_meta_texture();
 				g_meta_new = false;
 			}
-			g_meta_timer += dt;
-			if (g_meta_timer <= META_SHOW_DURATION) {
+			if (g_meta_timer <= META_SHOW_DURATION && g_meta_tex_valid) {
 				glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
 				glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
 				render_meta_overlay(cur_w, cur_h);
