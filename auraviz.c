@@ -5913,16 +5913,7 @@ static void* Thread(void* p_data) {
 			}
 			config_PutInt(p->p_obj, "auraviz-preset", p->user_preset);
 		}
-		if (p->user_preset == -2) {
-				/* Stopped mode: render black screen, sleep to save CPU */
-				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-				glClear(GL_COLOR_BUFFER_BIT);
-				SwapBuffers(p->hdc);
-				block_Release(p_block);
-				Sleep(50);
-				continue;
-			}
-			if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS) {
+		if (p->user_preset > 0 && p->user_preset <= NUM_PRESETS) {
 			int target = p->user_preset - 1;
 			if (target != p->preset && !p->crossfading) {
 				p->prev_preset = p->preset; p->preset = target;
