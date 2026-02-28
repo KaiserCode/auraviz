@@ -28,10 +28,15 @@
 #include <vlc_aout.h>
 #include <vlc_block.h>
 #include <vlc_configuration.h>
+#include <vlc_input.h>
+#include <vlc_playlist.h>
 
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <GL/wglext.h>
+#ifndef GL_BGRA_EXT
+#define GL_BGRA_EXT 0x80E1
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -70,6 +75,7 @@ change_integer_range(0, 100)
 add_integer("auraviz-smooth", 50, "Smoothing", "0-100", false)
 change_integer_range(0, 100)
 add_bool("auraviz-ontop", true, "Always on top", "Keep visualization window above other windows", false)
+add_bool("auraviz-meta", true, "Show song info", "Display artist and title overlay on song change", false)
 set_callbacks(Open, Close)
 add_shortcut("auraviz")
 vlc_module_end()
@@ -5181,6 +5187,17 @@ static HICON g_app_icon = NULL;
 static int g_persistent_x = CW_USEDEFAULT, g_persistent_y = CW_USEDEFAULT;
 static bool g_has_saved_position = false;
 
+/* == Song Metadata Overlay == */
+#define META_MAX 512
+static wchar_t g_meta_text[META_MAX] = L"";    /* "Artist \x2014 Title" or fallback */
+static volatile bool g_meta_new = false;         /* flag: new metadata ready */
+static float g_meta_timer = 0.0f;                /* seconds since song change */
+#define META_SHOW_DURATION 5.0f                  /* total display time */
+#define META_FADE_START    3.5f                  /* start fading at this time */
+static GLuint g_meta_texture = 0;
+static int g_meta_tex_w = 0, g_meta_tex_h = 0;
+static bool g_meta_tex_valid = false;
+
 /* Create a 32x32 RGBA icon programmatically (spectrum circle design) */
 static HICON create_auraviz_icon(void) {
 	const int S = 32;
@@ -5351,6 +5368,237 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		break;
 	}
 	return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* == Metadata Fetching == */
+static void fetch_metadata(vlc_object_t *p_obj) {
+	wchar_t result[META_MAX] = L"";
+	char *artist = NULL, *title = NULL, *uri = NULL;
+	bool got_meta = false;
+
+	/* Try to get metadata from the current playlist input */
+	playlist_t *pl = pl_Get(p_obj);
+	if (pl) {
+		input_thread_t *input = playlist_CurrentInput(pl);
+		if (input) {
+			input_item_t *item = input_GetItem(input);
+			if (item) {
+				vlc_mutex_lock(&item->lock);
+				if (item->p_meta) {
+					const char *m;
+					m = vlc_meta_Get(item->p_meta, vlc_meta_Artist);
+					if (m && m[0]) artist = strdup(m);
+					m = vlc_meta_Get(item->p_meta, vlc_meta_Title);
+					if (m && m[0]) title = strdup(m);
+				}
+				vlc_mutex_unlock(&item->lock);
+				uri = input_item_GetURI(item);
+			}
+			vlc_object_release(input);
+		}
+	}
+
+	/* Build display string with fallback chain */
+	if (artist && title) {
+		/* "Artist — Title" */
+		wchar_t w_artist[META_MAX/3], w_title[META_MAX/3];
+		MultiByteToWideChar(CP_UTF8, 0, artist, -1, w_artist, META_MAX/3);
+		MultiByteToWideChar(CP_UTF8, 0, title, -1, w_title, META_MAX/3);
+		_snwprintf(result, META_MAX-1, L"%s  \x2014  %s", w_artist, w_title);
+		got_meta = true;
+	} else if (title) {
+		MultiByteToWideChar(CP_UTF8, 0, title, -1, result, META_MAX);
+		got_meta = true;
+	} else if (artist) {
+		MultiByteToWideChar(CP_UTF8, 0, artist, -1, result, META_MAX);
+		got_meta = true;
+	}
+
+	/* Fallback: parse filename from URI */
+	if (!got_meta && uri) {
+		/* URI is like "file:///C:/Music/artist%20-%20song.mp3" */
+		const char *slash = strrchr(uri, '/');
+		const char *fname = slash ? slash + 1 : uri;
+		/* Decode %20 etc and strip extension */
+		char decoded[META_MAX];
+		int di = 0;
+		for (int i = 0; fname[i] && di < META_MAX-1; i++) {
+			if (fname[i] == '%' && fname[i+1] && fname[i+2]) {
+				char hex[3] = { fname[i+1], fname[i+2], 0 };
+				decoded[di++] = (char)strtol(hex, NULL, 16);
+				i += 2;
+			} else {
+				decoded[di++] = fname[i];
+			}
+		}
+		decoded[di] = 0;
+		/* Strip extension */
+		char *dot = strrchr(decoded, '.');
+		if (dot) *dot = 0;
+		/* Replace underscores with spaces */
+		for (int i = 0; decoded[i]; i++)
+			if (decoded[i] == '_') decoded[i] = ' ';
+		if (decoded[0]) {
+			MultiByteToWideChar(CP_UTF8, 0, decoded, -1, result, META_MAX);
+			got_meta = true;
+		}
+	}
+
+	free(artist); free(title); free(uri);
+
+	if (got_meta) {
+		wcsncpy(g_meta_text, result, META_MAX-1);
+		g_meta_text[META_MAX-1] = 0;
+		g_meta_new = true;
+		g_meta_timer = 0.0f;
+		g_meta_tex_valid = false;
+
+		/* Also set window title */
+		wchar_t wtitle[META_MAX + 16];
+		_snwprintf(wtitle, META_MAX+15, L"AuraViz - %s", result);
+		if (g_persistent_hwnd) SetWindowTextW(g_persistent_hwnd, wtitle);
+	}
+}
+
+/* == Text-to-Texture Rendering (GDI) == */
+static void create_meta_texture(void) {
+	if (g_meta_text[0] == 0) return;
+
+	/* Create a memory DC and bitmap for text rendering */
+	HDC screen_dc = GetDC(NULL);
+	HDC mem_dc = CreateCompatibleDC(screen_dc);
+
+	/* Create font - use a nice size, semibold */
+	HFONT font = CreateFontW(
+		28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+		CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+	if (!font) font = CreateFontW(
+		28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+		DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Arial");
+	HFONT old_font = SelectObject(mem_dc, font);
+
+	/* Measure text size */
+	SIZE sz;
+	GetTextExtentPoint32W(mem_dc, g_meta_text, (int)wcslen(g_meta_text), &sz);
+	int tex_w = sz.cx + 24;  /* padding */
+	int tex_h = sz.cy + 12;
+
+	/* Round up to power of 2 for better GL compat */
+	int pot_w = 1; while (pot_w < tex_w) pot_w <<= 1;
+	int pot_h = 1; while (pot_h < tex_h) pot_h <<= 1;
+
+	/* Create DIB section (32-bit BGRA) */
+	BITMAPINFO bmi = { 0 };
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = pot_w;
+	bmi.bmiHeader.biHeight = pot_h; /* bottom-up */
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+	BYTE *pixels = NULL;
+	HBITMAP bmp = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, (void**)&pixels, NULL, 0);
+	HBITMAP old_bmp = SelectObject(mem_dc, bmp);
+
+	/* Clear to transparent black */
+	memset(pixels, 0, pot_w * pot_h * 4);
+
+	/* Draw dark semi-transparent background bar */
+	SetBkMode(mem_dc, TRANSPARENT);
+	int text_y = (pot_h - sz.cy) / 2;
+	int text_x = 12;
+
+	/* Draw background rectangle */
+	for (int y = text_y - 4; y < text_y + sz.cy + 4 && y < pot_h; y++) {
+		if (y < 0) continue;
+		for (int x = 0; x < tex_w && x < pot_w; x++) {
+			BYTE *p = pixels + (y * pot_w + x) * 4;
+			p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 160; /* BGRA: black, ~63% opacity */
+		}
+	}
+
+	/* Draw text in white */
+	SetTextColor(mem_dc, RGB(255, 255, 255));
+	TextOutW(mem_dc, text_x, text_y, g_meta_text, (int)wcslen(g_meta_text));
+
+	/* Now fix alpha channel - GDI doesn't set alpha, we need to fix pixels where text was drawn */
+	/* Strategy: text pixels will have non-zero R/G/B on black bg */
+	for (int y = 0; y < pot_h; y++) {
+		for (int x = 0; x < pot_w; x++) {
+			BYTE *p = pixels + (y * pot_w + x) * 4;
+			BYTE max_c = p[0]; if (p[1] > max_c) max_c = p[1]; if (p[2] > max_c) max_c = p[2];
+			if (max_c > 0) {
+				/* Text pixel: use the max channel as alpha, set color to white */
+				p[3] = max_c > p[3] ? max_c : p[3];
+			}
+		}
+	}
+
+	/* Upload to OpenGL texture */
+	if (!g_meta_texture) glGenTextures(1, &g_meta_texture);
+	glBindTexture(GL_TEXTURE_2D, g_meta_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pot_w, pot_h, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
+
+	g_meta_tex_w = pot_w;
+	g_meta_tex_h = pot_h;
+	g_meta_tex_valid = true;
+
+	/* Cleanup GDI */
+	SelectObject(mem_dc, old_bmp);
+	SelectObject(mem_dc, old_font);
+	DeleteObject(bmp);
+	DeleteObject(font);
+	DeleteDC(mem_dc);
+	ReleaseDC(NULL, screen_dc);
+}
+
+/* Render metadata overlay on screen */
+static void render_meta_overlay(int screen_w, int screen_h) {
+	if (!g_meta_tex_valid || !g_meta_texture) return;
+	if (g_meta_timer > META_SHOW_DURATION) return;
+
+	/* Calculate alpha with fade */
+	float alpha = 1.0f;
+	if (g_meta_timer > META_FADE_START) {
+		alpha = 1.0f - (g_meta_timer - META_FADE_START) / (META_SHOW_DURATION - META_FADE_START);
+		if (alpha < 0.0f) alpha = 0.0f;
+	}
+
+	/* Position: bottom-left with some margin */
+	float margin_x = 16.0f / (float)screen_w;
+	float margin_y = 24.0f / (float)screen_h;
+	float quad_w = (float)g_meta_tex_w / (float)screen_w * 2.0f;
+	float quad_h = (float)g_meta_tex_h / (float)screen_h * 2.0f;
+	float x0 = -1.0f + margin_x;
+	float y0 = -1.0f + margin_y;
+	float x1 = x0 + quad_w;
+	float y1 = y0 + quad_h;
+
+	/* Clamp to screen */
+	if (x1 > 0.95f) { x1 = 0.95f; x0 = x1 - quad_w; }
+
+	/* Draw textured quad with alpha blending */
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glEnable(GL_TEXTURE_2D);
+	glBindTexture(GL_TEXTURE_2D, g_meta_texture);
+
+	glColor4f(1.0f, 1.0f, 1.0f, alpha);
+	glBegin(GL_QUADS);
+		glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y0);
+		glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y0);
+		glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y1);
+		glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y1);
+	glEnd();
+
+	glDisable(GL_TEXTURE_2D);
+	glDisable(GL_BLEND);
+	glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 }
 
 static int init_gl_context(auraviz_thread_t * p) {
@@ -5575,6 +5823,7 @@ static void* Thread(void* p_data) {
 		if (lp_val != p->user_preset) p->user_preset = lp_val;
 		p->gain = config_GetInt(p->p_obj, "auraviz-gain");
 		p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
+		bool show_meta = config_GetInt(p->p_obj, "auraviz-meta") != 0;
 
 		int active;
 		/* Handle keyboard preset navigation */
@@ -5645,11 +5894,29 @@ static void* Thread(void* p_data) {
 			gl_UseProgram(0);
 		}
 
+		/* Render metadata overlay (artist/title) if enabled */
+		if (show_meta && (g_meta_new || g_meta_tex_valid)) {
+			gl_UseProgram(0); /* disable shader for fixed-function overlay */
+			if (g_meta_new) {
+				create_meta_texture();
+				g_meta_new = false;
+			}
+			g_meta_timer += dt;
+			if (g_meta_timer <= META_SHOW_DURATION) {
+				glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+				glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+				render_meta_overlay(cur_w, cur_h);
+				glMatrixMode(GL_PROJECTION); glPopMatrix();
+				glMatrixMode(GL_MODELVIEW); glPopMatrix();
+			}
+		}
+
 		SwapBuffers(p->hdc); block_Release(p_block);
 	}
 	for (int i = 0; i < NUM_PRESETS; i++) if (p->programs[i]) gl_DeleteProgram(p->programs[i]);
 	if (p->blend_program) gl_DeleteProgram(p->blend_program);
 	if (p->spectrum_tex) glDeleteTextures(1, &p->spectrum_tex);
+	if (g_meta_texture) { glDeleteTextures(1, &g_meta_texture); g_meta_texture = 0; g_meta_tex_valid = false; }
 	destroy_fbos(p);
 	g_last_preset = p->preset;
 	/* Save window position for restoration on next song */
@@ -5726,6 +5993,10 @@ static int Open(vlc_object_t * p_this) {
 	p_filter->fmt_in.audio.i_format = VLC_CODEC_FL32;
 	p_filter->fmt_out.audio = p_filter->fmt_in.audio;
 	p_filter->pf_audio_filter = DoWork;
+
+	/* Fetch song metadata for overlay display */
+	fetch_metadata(p_this);
+
 	msg_Info(p_filter, "AuraViz started (%d presets, OpenGL, crossfade %.1fs)", NUM_PRESETS, CROSSFADE_DURATION);
 	return VLC_SUCCESS;
 }
