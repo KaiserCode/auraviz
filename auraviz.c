@@ -5502,12 +5502,12 @@ static void create_meta_texture(void) {
 	if (sz_title.cx > max_w) max_w = sz_title.cx;
 
 	int total_h = margin_top;
-	int y_artist = total_h;
-	if (g_meta_artist[0]) total_h += sz_artist.cy + line_gap;
+	int y_title = total_h;
+	if (g_meta_title[0]) total_h += sz_title.cy + line_gap;
 	int y_album = total_h;
 	if (g_meta_album[0]) total_h += sz_album.cy + line_gap;
-	int y_title = total_h;
-	if (g_meta_title[0]) total_h += sz_title.cy;
+	int y_artist = total_h;
+	if (g_meta_artist[0]) total_h += sz_artist.cy;
 	total_h += margin_top; /* bottom padding */
 
 	int tex_w = margin_left + max_w + margin_left + 12; /* extra for glow */
@@ -5873,17 +5873,17 @@ static void create_lrc_texture(int line_idx) {
 }
 
 /* Render lyrics overlay with word-by-word highlighting */
-static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) {
+static void render_lrc_overlay(int screen_w, int screen_h, float playback_time, float extra_alpha) {
 	if (!g_lrc_loaded || !g_lrc_tex_valid || !g_lrc_texture) return;
 	if (g_lrc_cur_line < 0 || g_lrc_cur_line >= g_lrc_line_count) return;
 
 	lrc_line_t *line = &g_lrc_lines[g_lrc_cur_line];
 
 	/* Calculate fade */
-	float alpha = 1.0f;
+	float alpha = extra_alpha;
 	if (g_lrc_line_fade < LRC_FADE_DURATION) {
-		alpha = g_lrc_line_fade / LRC_FADE_DURATION;
-		alpha = alpha * alpha * (3.0f - 2.0f * alpha); /* smoothstep */
+		float t = g_lrc_line_fade / LRC_FADE_DURATION;
+		alpha *= t * t * (3.0f - 2.0f * t); /* smoothstep */
 	}
 
 	/* Position: bottom center — use content size, not pot size */
@@ -6339,6 +6339,31 @@ static void* Thread(void* p_data) {
 				/* Find current line */
 				int new_line = find_lrc_line(playback_time);
 
+				/* Calculate how long current line should display.
+				   Fade out if we're past the end of this line's duration. */
+				float line_end_time = 0.0f;
+				if (new_line >= 0 && new_line < g_lrc_line_count) {
+					if (new_line + 1 < g_lrc_line_count)
+						line_end_time = g_lrc_lines[new_line + 1].time;
+					else {
+						/* Last line: show for 5 seconds then fade */
+						lrc_line_t *ll = &g_lrc_lines[new_line];
+						float last_word_time = ll->word_count > 0 ?
+							ll->words[ll->word_count - 1].time : ll->time;
+						line_end_time = last_word_time + 5.0f;
+					}
+				}
+
+				/* Hide lyrics if we're past the fade-out point */
+				bool lyrics_visible = (new_line >= 0 && playback_time < line_end_time + 1.0f);
+
+				/* Calculate fade-out alpha for end of line */
+				float lyrics_fade = 1.0f;
+				if (new_line >= 0 && playback_time > line_end_time - 1.0f) {
+					lyrics_fade = 1.0f - (playback_time - (line_end_time - 1.0f)) / 1.0f;
+					if (lyrics_fade < 0.0f) lyrics_fade = 0.0f;
+				}
+
 				if (new_line != g_lrc_cur_line) {
 					g_lrc_cur_line = new_line;
 					g_lrc_line_fade = 0.0f;
@@ -6349,11 +6374,11 @@ static void* Thread(void* p_data) {
 				}
 				g_lrc_line_fade += dt;
 
-				if (g_lrc_cur_line >= 0 && g_lrc_tex_valid) {
+				if (lyrics_visible && g_lrc_cur_line >= 0 && g_lrc_tex_valid && lyrics_fade > 0.0f) {
 					gl_UseProgram(0);
 					glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
 					glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
-					render_lrc_overlay(cur_w, cur_h, playback_time);
+					render_lrc_overlay(cur_w, cur_h, playback_time, lyrics_fade);
 					glMatrixMode(GL_PROJECTION); glPopMatrix();
 					glMatrixMode(GL_MODELVIEW); glPopMatrix();
 				}
