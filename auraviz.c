@@ -5849,20 +5849,6 @@ static void create_lrc_texture(int line_idx) {
 		}
 	}
 
-	/* Flip pixel rows so text is right-side up in GL */
-	{
-		int row_bytes = pot_w * 4;
-		BYTE *tmp = (BYTE*)malloc(row_bytes);
-		for (int y = 0; y < pot_h / 2; y++) {
-			BYTE *a = pixels + y * row_bytes;
-			BYTE *b = pixels + (pot_h - 1 - y) * row_bytes;
-			memcpy(tmp, a, row_bytes);
-			memcpy(a, b, row_bytes);
-			memcpy(b, tmp, row_bytes);
-		}
-		free(tmp);
-	}
-
 	if (!g_lrc_texture) glGenTextures(1, &g_lrc_texture);
 	glBindTexture(GL_TEXTURE_2D, g_lrc_texture);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -5932,30 +5918,24 @@ static void render_lrc_overlay(int screen_w, int screen_h, float playback_time) 
 
 	for (int w = 0; w < line->word_count; w++) {
 		if (playback_time >= line->words[w].time) {
-			/* This word has started — highlight includes it */
-			float word_end = margin_px + (float)line->words[w].pixel_x + (float)line->words[w].pixel_w;
-			/* Smooth transition within the word */
 			float word_start_time = line->words[w].time;
 			float word_end_time = (w + 1 < line->word_count) ? line->words[w+1].time : word_start_time + 0.5f;
 			float word_progress = (playback_time - word_start_time) / (word_end_time - word_start_time);
 			if (word_progress > 1.0f) word_progress = 1.0f;
 			if (word_progress < 0.0f) word_progress = 0.0f;
-			/* Smooth the progress */
 			word_progress = word_progress * word_progress * (3.0f - 2.0f * word_progress);
 			highlight_end_px = margin_px + (float)line->words[w].pixel_x +
 				(float)line->words[w].pixel_w * word_progress;
 		}
 	}
 
-	/* Convert pixel highlight to texture coordinate */
 	float highlight_u = highlight_end_px / (float)g_lrc_content_w * u_max;
 	if (highlight_u > u_max) highlight_u = u_max;
 
 	if (highlight_u > 0.0f) {
-		/* Draw highlight quad — only the highlighted portion, with bright color + additive blend */
 		float hx1 = x0 + (x1 - x0) * (highlight_u / u_max);
-		glBlendFunc(GL_SRC_ALPHA, GL_ONE); /* additive for glow effect */
-		glColor4f(1.0f, 1.0f, 0.6f, alpha * 0.9f); /* warm bright yellow-white */
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+		glColor4f(1.0f, 1.0f, 0.6f, alpha * 0.9f);
 		glBegin(GL_QUADS);
 			glTexCoord2f(0.0f, 0.0f);         glVertex2f(x0, y0);
 			glTexCoord2f(highlight_u, 0.0f);   glVertex2f(hx1, y0);
