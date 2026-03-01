@@ -77,6 +77,7 @@ add_bool("auraviz-meta", true, "Show song info", "Display artist and title overl
 add_string("auraviz-meta-text", "", "Metadata text", "Song info text set by Lua extension", false)
 add_bool("auraviz-lyrics", true, "Show lyrics", "Display synced lyrics from LRC files", false)
 add_string("auraviz-lyric-data", "", "Lyric data", "Serialized LRC data from Lua extension", false)
+add_integer("auraviz-lyric-offset", 1, "Lyric offset", "Offset in seconds to sync lyrics", false)
 set_callbacks(Open, Close)
 add_shortcut("auraviz")
 vlc_module_end()
@@ -5502,12 +5503,12 @@ static void create_meta_texture(void) {
 	if (sz_title.cx > max_w) max_w = sz_title.cx;
 
 	int total_h = margin_top;
-	int y_title = total_h;
-	if (g_meta_title[0]) total_h += sz_title.cy + line_gap;
+	int y_artist = total_h;
+	if (g_meta_artist[0]) total_h += sz_artist.cy + line_gap;
 	int y_album = total_h;
 	if (g_meta_album[0]) total_h += sz_album.cy + line_gap;
-	int y_artist = total_h;
-	if (g_meta_artist[0]) total_h += sz_artist.cy;
+	int y_title = total_h;
+	if (g_meta_title[0]) total_h += sz_title.cy;
 	total_h += margin_top; /* bottom padding */
 
 	int tex_w = margin_left + max_w + margin_left + 12; /* extra for glow */
@@ -6334,7 +6335,8 @@ static void* Thread(void* p_data) {
 
 			if (show_lyrics && g_lrc_loaded) {
 				/* Get playback time from accumulated samples */
-				float playback_time = p->time_acc;
+				float lyric_offset = (float)config_GetInt(p->p_obj, "auraviz-lyric-offset");
+				float playback_time = p->time_acc - lyric_offset;
 
 				/* Find current line */
 				int new_line = find_lrc_line(playback_time);
