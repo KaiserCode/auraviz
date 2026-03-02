@@ -5482,7 +5482,7 @@ static void create_meta_texture(void) {
 
 	/* Measure each line */
 	SIZE sz_artist = {0}, sz_album = {0}, sz_title = {0};
-	int margin_left = 30, margin_top = 20, line_gap = 8;
+	int margin_left = 30, margin_top = 35, line_gap = 10;
 
 	if (g_meta_artist[0]) {
 		SelectObject(mem_dc, font_artist);
@@ -6185,8 +6185,9 @@ static void* Thread(void* p_data) {
 		p->smooth = config_GetInt(p->p_obj, "auraviz-smooth");
 		bool show_meta = config_GetInt(p->p_obj, "auraviz-meta") != 0;
 
-		/* Check for new metadata from Lua every frame until text arrives or timeout */
-		if (show_meta && g_meta_timer < 5.0f) {
+		/* Check for new metadata from Lua every frame.
+		   Keep checking until data arrives (Lua extension may activate late). */
+		if (show_meta && (!g_meta_tex_valid || g_meta_timer < META_SHOW_DURATION)) {
 			char *meta_check = config_GetPsz(p->p_obj, "auraviz-meta-text");
 			if (meta_check && meta_check[0] && strcmp(meta_check, g_meta_last_config) != 0) {
 				/* Parse "artist|album|title" */
@@ -6342,27 +6343,30 @@ static void* Thread(void* p_data) {
 				int new_line = find_lrc_line(playback_time);
 
 				/* Calculate how long current line should display.
-				   Fade out if we're past the end of this line's duration. */
+				   Fade out after the last word is sung + a short hold. */
 				float line_end_time = 0.0f;
 				if (new_line >= 0 && new_line < g_lrc_line_count) {
-					if (new_line + 1 < g_lrc_line_count)
-						line_end_time = g_lrc_lines[new_line + 1].time;
-					else {
-						/* Last line: show for 5 seconds then fade */
-						lrc_line_t *ll = &g_lrc_lines[new_line];
-						float last_word_time = ll->word_count > 0 ?
-							ll->words[ll->word_count - 1].time : ll->time;
-						line_end_time = last_word_time + 5.0f;
+					lrc_line_t *ll = &g_lrc_lines[new_line];
+					float last_word_time = ll->word_count > 0 ?
+						ll->words[ll->word_count - 1].time : ll->time;
+					/* Hold for 2 seconds after last word, then fade */
+					float word_end = last_word_time + 2.0f;
+					if (new_line + 1 < g_lrc_line_count) {
+						/* Don't fade past the next line's start */
+						float next_start = g_lrc_lines[new_line + 1].time;
+						line_end_time = (word_end < next_start) ? word_end : next_start;
+					} else {
+						line_end_time = word_end;
 					}
 				}
 
 				/* Hide lyrics if we're past the fade-out point */
-				bool lyrics_visible = (new_line >= 0 && playback_time < line_end_time + 1.0f);
+				bool lyrics_visible = (new_line >= 0 && playback_time < line_end_time + 0.5f);
 
-				/* Calculate fade-out alpha for end of line */
+				/* Calculate fade-out alpha */
 				float lyrics_fade = 1.0f;
-				if (new_line >= 0 && playback_time > line_end_time - 1.0f) {
-					lyrics_fade = 1.0f - (playback_time - (line_end_time - 1.0f)) / 1.0f;
+				if (new_line >= 0 && playback_time > line_end_time - 0.5f) {
+					lyrics_fade = 1.0f - (playback_time - (line_end_time - 0.5f)) / 0.5f;
 					if (lyrics_fade < 0.0f) lyrics_fade = 0.0f;
 				}
 
